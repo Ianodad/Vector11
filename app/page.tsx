@@ -96,9 +96,7 @@ export default function Home() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-3 text-xs font-mono uppercase tracking-[0.18em]">
-            <span className="border-2 border-black px-3 py-1">
-              Black/White
-            </span>
+            <span className="border-2 border-black px-3 py-1">Black/White</span>
             <span className="border-2 border-black bg-black px-3 py-1 text-white">
               Live
             </span>
@@ -118,8 +116,8 @@ export default function Home() {
             <div className="flex h-125 flex-col gap-4 overflow-y-auto bg-white p-6">
               {messages.length === 0 ? (
                 <div className="border-2 border-dashed border-black p-5 text-sm">
-                  Ask for fixtures, form trends, or match previews. The assistant
-                  stays on the black-and-white brief.
+                  Ask for fixtures, form trends, or match previews. The
+                  assistant stays on the black-and-white brief.
                 </div>
               ) : (
                 messages.map((message) => (
@@ -134,7 +132,9 @@ export default function Home() {
                     <p className="text-[10px] font-mono uppercase tracking-[0.18em]">
                       {message.role === "user" ? "You" : "Vector11"}
                     </p>
-                    <p className="mt-2 whitespace-pre-wrap">{message.content}</p>
+                    <p className="mt-2 whitespace-pre-wrap">
+                      {message.content}
+                    </p>
                   </div>
                 ))
               )}
