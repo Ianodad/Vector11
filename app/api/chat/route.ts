@@ -26,6 +26,33 @@ const ASTRA_DB_APPLICATION_TOKEN = requiredEnv(
 );
 const OPEN_API_KEY = requiredEnv(process.env.OPEN_API_KEY, "OPEN_API_KEY");
 const EMBEDDING_DIMENSIONS = Number(process.env.EMBEDDING_DIMENSIONS) || 1000;
+const MAX_QUERY_VARIANTS = 6;
+const RRF_K = 60;
+const RRF_LIMIT = 10;
+const MAX_FOLLOWUP_QUERIES = 3;
+
+const QUERY_EXPANSIONS: Record<string, string[]> = {
+  "man utd": ["manchester united", "man united", "mufc"],
+  "man city": ["manchester city", "mcfc"],
+  spurs: ["tottenham hotspur", "tottenham"],
+  psg: ["paris saint-germain", "paris sg"],
+  ucl: ["champions league", "uefa champions league"],
+  uelf: ["europa league", "uefa europa league"],
+  epl: ["premier league"],
+  pl: ["premier league"],
+  "la liga": ["laliga"],
+  "serie a": ["serie-a"],
+};
+
+const QUERY_SYNONYMS: Array<[string, string]> = [
+  ["fixtures", "schedule"],
+  ["fixture", "schedule"],
+  ["table", "standings"],
+  ["stats", "statistics"],
+  ["transfer", "rumor"],
+  ["transfers", "rumors"],
+  ["injury", "injuries"],
+];
 
 const openai = new OpenAI({
   apiKey: OPEN_API_KEY,
@@ -40,6 +67,84 @@ const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN, {
 const db = client.db(ASTRA_DB_API_ENDPOINT, {
   keyspace: ASTRA_DB_NAMESPACE,
 });
+
+type RetrievedDoc = {
+  _id?: string;
+  content?: string;
+  source?: string;
+  $similarity?: number;
+};
+
+const normalizeQuery = (query: string): string => query.trim().toLowerCase();
+
+const expandQueryVariants = (query: string): string[] => {
+  const variants = new Set<string>([query]);
+  const normalized = normalizeQuery(query);
+
+  for (const [needle, expansions] of Object.entries(QUERY_EXPANSIONS)) {
+    if (!normalized.includes(needle)) continue;
+    for (const expansion of expansions) {
+      variants.add(query.replace(new RegExp(needle, "gi"), expansion));
+    }
+  }
+
+  for (const [needle, replacement] of QUERY_SYNONYMS) {
+    if (!normalized.includes(needle)) continue;
+    variants.add(query.replace(new RegExp(needle, "gi"), replacement));
+  }
+
+  return Array.from(variants).slice(0, MAX_QUERY_VARIANTS);
+};
+
+const rrfMerge = (
+  resultSets: RetrievedDoc[][],
+  limit = RRF_LIMIT,
+  k = RRF_K,
+): RetrievedDoc[] => {
+  const scored = new Map<string, { doc: RetrievedDoc; score: number }>();
+
+  resultSets.forEach((docs) => {
+    docs.forEach((doc, idx) => {
+      const key = doc._id ?? doc.content ?? JSON.stringify(doc);
+      if (!key) return;
+      const entry = scored.get(key) ?? { doc, score: 0 };
+      entry.score += 1 / (k + idx + 1);
+      scored.set(key, entry);
+    });
+  });
+
+  return Array.from(scored.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((entry) => entry.doc);
+};
+
+const buildFollowUpQueryPrompt = (
+  userQuery: string,
+  docs: RetrievedDoc[],
+): string => {
+  const snippets = docs
+    .slice(0, 3)
+    .map((doc, idx) => {
+      const text = (doc.content || "").replace(/\s+/g, " ").trim();
+      return `Doc ${idx + 1}: ${text.slice(0, 240)}`;
+    })
+    .join("\n");
+
+  return [
+    "Generate 2-3 short follow-up search queries to improve retrieval.",
+    "Keep them football-specific and concrete. No quotes, no numbering.",
+    `User query: ${userQuery}`,
+    `Top docs:\n${snippets}`,
+  ].join("\n");
+};
+
+const parseFollowUpQueries = (raw: string): string[] =>
+  raw
+    .split("\n")
+    .map((line) => line.replace(/^[-*\d.)\s]+/, "").trim())
+    .filter((line) => line.length > 2)
+    .slice(0, MAX_FOLLOWUP_QUERIES);
 
 export async function POST(request: Request) {
   try {
@@ -73,46 +178,113 @@ export async function POST(request: Request) {
     });
 
     let docContent = "";
-    //embedding
+    const queryVariants = expandQueryVariants(lastMessage);
+    console.log("[chat] query expansion", {
+      original: lastMessage,
+      variants: queryVariants,
+    });
+
+    // Embedding all variants at once keeps cost low and ensures consistent dimensions.
     const embeddingResponse = await openai.embeddings.create({
       model: "text-embedding-3-small",
-      input: lastMessage,
+      input: queryVariants,
       encoding_format: "float",
       dimensions: EMBEDDING_DIMENSIONS,
     });
-    const embedding = embeddingResponse.data[0].embedding;
+    const embeddings = embeddingResponse.data.map((item) => item.embedding);
     console.log("[chat] embedding", {
-      dimensions: embedding.length,
+      count: embeddings.length,
+      dimensions: embeddings[0]?.length ?? 0,
       configured: EMBEDDING_DIMENSIONS,
     });
 
-    //vector search
+    //vector search (hop 1)
     try {
       const collection = db.collection(ASTRA_DB_COLLECTION);
       console.log("[chat] vector search", {
         keyspace: ASTRA_DB_NAMESPACE,
         collection: ASTRA_DB_COLLECTION,
       });
-      const cursor = collection.find(
-        {},
-        {
-          sort: { $vector: embedding },
-          limit: 10,
-          includeSimilarity: true,
-          projection: { content: 1, source: 1 },
-        },
+      const resultsPerVariant: RetrievedDoc[][] = [];
+
+      for (const vectorEmbedding of embeddings) {
+        const cursor = collection.find(
+          {},
+          {
+            sort: { $vector: vectorEmbedding },
+            limit: RRF_LIMIT,
+            includeSimilarity: true,
+            projection: { _id: 1, content: 1, source: 1 },
+          },
+        );
+        resultsPerVariant.push(
+          (await cursor.toArray()) as unknown as RetrievedDoc[],
+        );
+      }
+
+      const merged = rrfMerge(resultsPerVariant);
+      console.log("[chat] vector search results", {
+        variants: resultsPerVariant.length,
+        mergedCount: merged.length,
+        sampleKeys: merged[0] ? Object.keys(merged[0]) : [],
+      });
+
+      // Multi-hop: generate follow-up queries from top docs and re-search.
+      let finalDocs = merged;
+      try {
+        const followUpPrompt = buildFollowUpQueryPrompt(lastMessage, merged);
+        const followUpResponse = await openai.chat.completions.create({
+          model: "gpt-5-mini",
+          messages: [
+            { role: "system", content: "You generate search queries only." },
+            { role: "user", content: followUpPrompt },
+          ],
+        });
+        const followUpText =
+          followUpResponse.choices[0]?.message?.content ?? "";
+        const followUpQueries = parseFollowUpQueries(followUpText);
+        console.log("[chat] follow-up queries", followUpQueries);
+
+        if (followUpQueries.length > 0) {
+          const followUpEmbeddings = await openai.embeddings.create({
+            model: "text-embedding-3-small",
+            input: followUpQueries,
+            encoding_format: "float",
+            dimensions: EMBEDDING_DIMENSIONS,
+          });
+          const followUpSets: RetrievedDoc[][] = [];
+          for (const item of followUpEmbeddings.data) {
+            const cursor = collection.find(
+              {},
+              {
+                sort: { $vector: item.embedding },
+                limit: RRF_LIMIT,
+                includeSimilarity: true,
+                projection: { _id: 1, content: 1, source: 1 },
+              },
+            );
+            followUpSets.push(
+              (await cursor.toArray()) as unknown as RetrievedDoc[],
+            );
+          }
+          finalDocs = rrfMerge([merged, ...followUpSets]);
+          console.log("[chat] multi-hop merge", {
+            followUpCount: followUpQueries.length,
+            finalCount: finalDocs.length,
+          });
+        }
+      } catch (followUpError) {
+        console.warn("[chat] follow-up query generation failed", followUpError);
+      }
+
+      docContent = JSON.stringify(
+        finalDocs.map((doc) => ({
+          content: doc.content,
+          source: doc.source,
+        })),
       );
 
-      const documents = await cursor.toArray();
-      console.log("[chat] vector search results", {
-        count: documents.length,
-        sampleKeys: documents[0] ? Object.keys(documents[0]) : [],
-      });
-      const docsMap = documents.map((doc) => doc.content);
-
-      docContent = JSON.stringify(docsMap);
-
-      if (documents.length === 0) {
+      if (finalDocs.length === 0) {
         const total = await collection.countDocuments({}, 2000);
         const fallbackDocs = await collection.find({}, { limit: 1 }).toArray();
         console.log("[chat] collection check", {
