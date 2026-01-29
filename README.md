@@ -2,6 +2,7 @@
 
 Vector11 is a monochrome football intelligence chat app that answers matchday
 questions with a RAG pipeline over football news and stats sources.
+<img width="1387" height="893" alt="071b9a19-a987-496c-a1c0-a663d92e7e7e" src="https://github.com/user-attachments/assets/74a3a086-61ec-496e-96f0-de6071be0b43" />
 
 ## Features
 - RAG chat UI with tactical, data-aware responses
