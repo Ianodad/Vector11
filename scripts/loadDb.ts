@@ -342,11 +342,6 @@ const createCollection = async (
       vector: {
         dimension: DEFAULT_VECTOR_DIMENSIONS,
         metric: similarityMetric,
-        // service: {
-        //   provider: "openai",
-        //   modelName: "text-embedding-3-small",
-        //   authentication: { providerKey: "my-openai-key" },
-        // },
       },
     });
     console.log(res);

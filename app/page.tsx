@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import Image from "next/image";
 import Vector11Logo from "./assets/logo.png";
 
@@ -14,6 +14,15 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -71,7 +80,12 @@ export default function Home() {
       <main className="mx-auto flex w-full max-w-5xl flex-col gap-10 px-6 py-10 sm:px-10 lg:px-14">
         <header className="flex flex-col gap-6 border-4 border-black p-6 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-5">
-            <Image src={Vector11Logo} alt="Vector11 Logo" width={190} priority />
+            <Image
+              src={Vector11Logo}
+              alt="Vector11 Logo"
+              width={190}
+              priority
+            />
             <div className="border-l-4 border-black pl-5">
               <p className="text-xs font-mono uppercase tracking-[0.25em]">
                 Matchday Intelligence
@@ -101,7 +115,7 @@ export default function Home() {
                 v11
               </span>
             </div>
-            <div className="flex min-h-[440px] flex-col gap-4 bg-white p-6">
+            <div className="flex h-125 flex-col gap-4 overflow-y-auto bg-white p-6">
               {messages.length === 0 ? (
                 <div className="border-2 border-dashed border-black p-5 text-sm">
                   Ask for fixtures, form trends, or match previews. The assistant
@@ -124,6 +138,7 @@ export default function Home() {
                   </div>
                 ))
               )}
+              <div ref={messagesEndRef} />
             </div>
             <form
               onSubmit={handleSubmit}
@@ -147,7 +162,7 @@ export default function Home() {
             </form>
           </div>
 
-          <aside className="flex flex-col gap-6 border-4 border-black p-6">
+          <aside className="sticky top-6 flex h-fit flex-col gap-6 border-4 border-black p-6">
             <div>
               <h3 className="text-sm font-mono uppercase tracking-[0.2em]">
                 Prompt Board
@@ -157,21 +172,21 @@ export default function Home() {
               </p>
             </div>
             <div className="flex flex-col gap-3">
-                {[
-                  "Scout the weekend fixtures",
-                  "Summarize injury updates",
-                  "Compare xG trends for top 4",
-                  "Who is in form this month?",
-                ].map((prompt) => (
-                  <button
-                    key={prompt}
-                    type="button"
-                    onClick={() => setInput(prompt)}
-                    className="border-2 border-black px-4 py-3 text-left text-sm uppercase tracking-[0.08em] transition hover:bg-black hover:text-white"
-                  >
-                    {prompt}
-                  </button>
-                ))}
+              {[
+                "Scout the weekend fixtures",
+                "Summarize injury updates",
+                "Compare xG trends for top 4",
+                "Who is in form this month?",
+              ].map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  onClick={() => setInput(prompt)}
+                  className="border-2 border-black px-4 py-3 text-left text-sm uppercase tracking-[0.08em] transition hover:bg-black hover:text-white"
+                >
+                  {prompt}
+                </button>
+              ))}
             </div>
             <div className="border-2 border-black bg-black p-4 text-white">
               <p className="text-xs font-mono uppercase tracking-[0.2em]">
