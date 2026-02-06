@@ -1,3 +1,4 @@
+// app/page.tsx
 "use client";
 
 import { useState, useRef, useEffect } from "react";
@@ -11,6 +12,12 @@ type ChatMessage = {
 };
 
 export default function Home() {
+  const contextPrompts = [
+    "Who is the top scorer in the EPL right now?",
+    "Who are the top teams in the EPL this season?",
+    "Which EPL team has the best defensive record so far?",
+    "Which EPL players have the most assists this season?",
+  ];
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -138,13 +145,39 @@ export default function Home() {
                   </div>
                 ))
               )}
+              {isLoading && (
+                <div className="max-w-[85%] border-2 border-black bg-white px-4 py-3 text-black shadow-[0_0_0_2px_#000_inset]">
+                  <p className="text-[10px] font-mono uppercase tracking-[0.18em]">
+                    Vector11
+                  </p>
+                  <p
+                    className="mt-2 text-sm"
+                    role="status"
+                    aria-live="polite"
+                    aria-label="Vector11 is thinking"
+                  >
+                    Thinking
+                    <span className="inline-flex">
+                      <span className="animate-bounce [animation-delay:0ms]">
+                        .
+                      </span>
+                      <span className="animate-bounce [animation-delay:150ms]">
+                        .
+                      </span>
+                      <span className="animate-bounce [animation-delay:300ms]">
+                        .
+                      </span>
+                    </span>
+                  </p>
+                </div>
+              )}
               <div ref={messagesEndRef} />
             </div>
             <form
               onSubmit={handleSubmit}
               className="border-t-4 border-black bg-white p-4"
             >
-              <div className="flex flex-col gap-3 sm:flex-row">
+            <div className="flex flex-col gap-3 sm:flex-row">
                 <input
                   value={input}
                   onChange={(event) => setInput(event.target.value)}
@@ -154,9 +187,12 @@ export default function Home() {
                 <button
                   type="submit"
                   disabled={isLoading}
-                  className="border-4 border-black bg-black px-6 py-3 text-sm font-mono uppercase tracking-[0.2em] text-white transition hover:translate-x-1 hover:translate-y-1 disabled:opacity-60"
+                  className="group inline-flex cursor-pointer items-center gap-2 border-4 border-black bg-black px-6 py-3 text-sm font-mono uppercase tracking-[0.2em] text-white transition hover:translate-x-1 hover:translate-y-1 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {isLoading ? "Sending" : "Send"}
+                  <span className="opacity-0 transition-opacity group-hover:opacity-100">
+                    ☞
+                  </span>
                 </button>
               </div>
             </form>
@@ -172,19 +208,20 @@ export default function Home() {
               </p>
             </div>
             <div className="flex flex-col gap-3">
-              {[
-                "Scout the weekend fixtures",
-                "Summarize injury updates",
-                "Compare xG trends for top 4",
-                "Who is in form this month?",
-              ].map((prompt) => (
+              <p className="text-xs font-mono uppercase tracking-[0.16em]">
+                Context Prompt Cards
+              </p>
+              {contextPrompts.map((prompt) => (
                 <button
                   key={prompt}
                   type="button"
                   onClick={() => setInput(prompt)}
-                  className="border-2 border-black px-4 py-3 text-left text-sm uppercase tracking-[0.08em] transition hover:bg-black hover:text-white"
+                  className="group flex cursor-pointer items-center justify-between border-2 border-black px-4 py-3 text-left text-sm uppercase tracking-[0.08em] transition hover:bg-black hover:text-white"
                 >
-                  {prompt}
+                  <span>{prompt}</span>
+                  <span className="opacity-0 transition-opacity group-hover:opacity-100">
+                    ☞
+                  </span>
                 </button>
               ))}
             </div>

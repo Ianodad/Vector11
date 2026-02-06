@@ -74,10 +74,37 @@ export async function POST(request: Request) {
     });
 
     let docContent = "";
+
+    // rewrite query using conversation context for better retrieval
+    let retrievalQuery = lastMessage;
+    if (chatMessages.length > 1) {
+      const recentContext = chatMessages
+        .slice(-4)
+        .map((m) => `${m.role}: ${m.content}`)
+        .join("\n");
+      const rewrite = await openai.chat.completions.create({
+        model: "gpt-5-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "Rewrite the user's latest message as a standalone football stats search query. Include all relevant entities (players, teams, competitions, stats, dates) mentioned in the conversation. Output ONLY the rewritten query, nothing else.",
+          },
+          { role: "user", content: recentContext },
+        ],
+      });
+      retrievalQuery =
+        rewrite.choices[0]?.message?.content?.trim() ?? lastMessage;
+      console.log("[chat] rewritten query", {
+        original: lastMessage.slice(0, 80),
+        rewritten: retrievalQuery.slice(0, 80),
+      });
+    }
+
     //embedding
     const embeddingResponse = await openai.embeddings.create({
       model: "text-embedding-3-small",
-      input: lastMessage,
+      input: retrievalQuery,
       encoding_format: "float",
       dimensions: EMBEDDING_DIMENSIONS,
     });
@@ -133,7 +160,7 @@ export async function POST(request: Request) {
     const template = {
       role: "system",
       content: `You are Vector11, a football stats assistant. Always use the retrieved context (from the vector database) as the primary source of truth. If the context answers the question, summarize it clearly. If the context is partial, combine
-  it with your football knowledge and explicitly label which parts are from context vs. general knowledge. If there is no relevant context, say so and answer from general knowledge. Be concise, tactical, and data-aware. Here is the context: ${docContent}`,
+  it with your football knowledge and explicitly label which parts are from context vs. general knowledge. If there is no relevant context, say so and answer from general knowledge. If the user asks for standings, top teams, rankings, or league tables, return a markdown table first, then a short "Quick read" summary. Be concise, tactical, and data-aware. Here is the context: ${docContent}`,
     };
 
     const response = await openai.chat.completions.create({
