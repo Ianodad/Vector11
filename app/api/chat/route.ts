@@ -1,3 +1,4 @@
+// app/api/chat/route.ts
 import OpenAI from "openai";
 import { DataAPIClient, vector } from "@datastax/astra-db-ts";
 
