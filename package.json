@@ -17,11 +17,14 @@
     "@langchain/textsplitters": "^1.0.1",
     "dotenv": "^17.2.3",
     "fast-xml-parser": "^5.3.3",
+    "langchain": "^1.2.18",
     "next": "16.1.4",
     "openai": "^6.16.0",
     "puppeteer": "^24.35.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "ts-node": "^10.9.2"
   },
   "devDependencies": {

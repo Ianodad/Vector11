@@ -3,6 +3,8 @@
 
 import { useState, useRef, useEffect } from "react";
 import Image from "next/image";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import Vector11Logo from "./assets/logo.png";
 
 type ChatMessage = {
@@ -21,6 +23,7 @@ export default function Home() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [multiQuery, setMultiQuery] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
@@ -51,7 +54,7 @@ export default function Home() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ messages: outgoingMessages }),
+        body: JSON.stringify({ messages: outgoingMessages, multiQuery }),
       });
 
       if (!response.ok) {
@@ -139,9 +142,17 @@ export default function Home() {
                     <p className="text-[10px] font-mono uppercase tracking-[0.18em]">
                       {message.role === "user" ? "You" : "Vector11"}
                     </p>
-                    <p className="mt-2 whitespace-pre-wrap">
-                      {message.content}
-                    </p>
+                    {message.role === "assistant" ? (
+                      <div className="mt-2 prose-v11">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {message.content}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      <p className="mt-2 whitespace-pre-wrap">
+                        {message.content}
+                      </p>
+                    )}
                   </div>
                 ))
               )}
@@ -224,6 +235,31 @@ export default function Home() {
                   </span>
                 </button>
               ))}
+            </div>
+            <div className="border-2 border-black p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-mono uppercase tracking-[0.2em]">
+                    Multi-Query
+                  </p>
+                  <p className="mt-1 text-xs text-gray-600">
+                    Search from 3 angles per question
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMultiQuery((prev) => !prev)}
+                  className={`relative h-7 w-12 shrink-0 cursor-pointer border-2 border-black transition-colors ${
+                    multiQuery ? "bg-black" : "bg-white"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 h-5 w-5 border-2 border-black transition-all ${
+                      multiQuery ? "left-5 bg-white" : "left-0.5 bg-black"
+                    }`}
+                  />
+                </button>
+              </div>
             </div>
             <div className="border-2 border-black bg-black p-4 text-white">
               <p className="text-xs font-mono uppercase tracking-[0.2em]">

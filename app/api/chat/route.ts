@@ -1,6 +1,8 @@
 // app/api/chat/route.ts
 import OpenAI from "openai";
 import { DataAPIClient, vector } from "@datastax/astra-db-ts";
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
 
 const requiredEnv = (value: string | undefined, name: string): string => {
   if (!value) {
@@ -32,6 +34,11 @@ const openai = new OpenAI({
   apiKey: OPEN_API_KEY,
 });
 
+const chat = new ChatOpenAI({
+  model: "gpt-5-mini",
+  apiKey: OPEN_API_KEY,
+});
+
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN, {
   timeoutDefaults: {
     requestTimeoutMs: 20000,
@@ -45,7 +52,7 @@ const db = client.db(ASTRA_DB_API_ENDPOINT, {
 export async function POST(request: Request) {
   try {
     console.log("[chat] request received");
-    const { messages } = await request.json();
+    const { messages, multiQuery: multiQueryEnabled } = await request.json();
     const chatMessages = Array.isArray(messages)
       ? messages
           .filter(
@@ -74,6 +81,8 @@ export async function POST(request: Request) {
     });
 
     let docContent = "";
+    let relevantDocs: any[] = [];
+    let totalTokensUsed = 0;
 
     // rewrite query using conversation context for better retrieval
     let retrievalQuery = lastMessage;
@@ -93,82 +102,151 @@ export async function POST(request: Request) {
           { role: "user", content: recentContext },
         ],
       });
+      totalTokensUsed += rewrite.usage?.total_tokens ?? 0;
       retrievalQuery =
         rewrite.choices[0]?.message?.content?.trim() ?? lastMessage;
       console.log("[chat] rewritten query", {
         original: lastMessage.slice(0, 80),
         rewritten: retrievalQuery.slice(0, 80),
+        tokens: rewrite.usage?.total_tokens ?? 0,
       });
     }
 
-    //embedding
-    const embeddingResponse = await openai.embeddings.create({
-      model: "text-embedding-3-small",
-      input: retrievalQuery,
-      encoding_format: "float",
-      dimensions: EMBEDDING_DIMENSIONS,
-    });
-    const embedding = embeddingResponse.data[0].embedding;
-    console.log("[chat] embedding", {
-      dimensions: embedding.length,
-      configured: EMBEDDING_DIMENSIONS,
-    });
+    const collection = db.collection(ASTRA_DB_COLLECTION);
 
-    //vector search
-    try {
-      const collection = db.collection(ASTRA_DB_COLLECTION);
-      console.log("[chat] vector search", {
-        keyspace: ASTRA_DB_NAMESPACE,
-        collection: ASTRA_DB_COLLECTION,
+    // helper: embed a query and search the vector DB
+    async function searchByQuery(query: string, limit: number = 10) {
+      const resp = await openai.embeddings.create({
+        model: "text-embedding-3-small",
+        input: query,
+        encoding_format: "float",
+        dimensions: EMBEDDING_DIMENSIONS,
       });
       const cursor = collection.find(
         {},
         {
-          sort: { $vector: embedding },
-          limit: 10,
+          sort: { $vector: resp.data[0].embedding },
+          limit,
           includeSimilarity: true,
           projection: { content: 1, source: 1 },
         },
       );
+      return cursor.toArray();
+    }
 
-      const documents = await cursor.toArray();
-      console.log("[chat] vector search results", {
-        count: documents.length,
-        sampleKeys: documents[0] ? Object.keys(documents[0]) : [],
+    try {
+      console.log("[chat] retrieval mode", {
+        multiQuery: Boolean(multiQueryEnabled),
+        keyspace: ASTRA_DB_NAMESPACE,
+        collection: ASTRA_DB_COLLECTION,
       });
-      const docsMap = documents.map((doc) => doc.content);
 
-      docContent = JSON.stringify(docsMap);
+      let allDocuments: any[];
 
-      if (documents.length === 0) {
-        const total = await collection.countDocuments({}, 2000);
-        const fallbackDocs = await collection.find({}, { limit: 1 }).toArray();
-        console.log("[chat] collection check", {
-          countUpperBound: 2000,
-          count: total,
-          sampleKeys: fallbackDocs[0] ? Object.keys(fallbackDocs[0]) : [],
-          hasVectorField: Boolean(fallbackDocs[0]?.vector),
-          hasDollarVectorField: Boolean(fallbackDocs[0]?.$vector),
+      if (multiQueryEnabled) {
+        // generate 3 diverse search queries from the user's question
+        const mqResponse = await openai.chat.completions.create({
+          model: "gpt-5-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Generate exactly 3 diverse search queries for a football stats vector database based on the user's question. Each query should approach the topic from a different angle (e.g. stats, narrative, comparison). Output ONLY the 3 queries, one per line, no numbering or extra text.",
+            },
+            { role: "user", content: retrievalQuery },
+          ],
         });
+        totalTokensUsed += mqResponse.usage?.total_tokens ?? 0;
+        const queries = (mqResponse.choices[0]?.message?.content ?? retrievalQuery)
+          .split("\n")
+          .map((q) => q.trim())
+          .filter((q) => q.length > 0)
+          .slice(0, 3);
+
+        console.log("[chat] multi-query searches", queries);
+
+        // run all 3 searches in parallel, 5 results each
+        const searchResults = await Promise.all(
+          queries.map((q) => searchByQuery(q, 5)),
+        );
+
+        // merge & deduplicate by content prefix
+        const seen = new Set<string>();
+        allDocuments = [];
+        for (const docs of searchResults) {
+          for (const doc of docs) {
+            const key = doc.content?.slice(0, 200) ?? "";
+            if (!seen.has(key)) {
+              seen.add(key);
+              allDocuments.push(doc);
+            }
+          }
+        }
+        // sort by similarity descending
+        allDocuments.sort(
+          (a, b) => (b.$similarity ?? 0) - (a.$similarity ?? 0),
+        );
+      } else {
+        // single-query retrieval
+        allDocuments = await searchByQuery(retrievalQuery);
+      }
+
+      relevantDocs = allDocuments.filter(
+        (doc) => (doc.$similarity ?? 0) >= 0.5,
+      );
+      console.log("[chat] vector search results", {
+        mode: multiQueryEnabled ? "multi-query" : "single-query",
+        total: allDocuments.length,
+        aboveThreshold: relevantDocs.length,
+        topSimilarity: allDocuments[0]?.$similarity ?? null,
+        lowestKept: relevantDocs.at(-1)?.$similarity ?? null,
+        tokensUsedSoFar: totalTokensUsed,
+      });
+
+      docContent = JSON.stringify(relevantDocs.map((doc) => doc.content));
+
+      if (allDocuments.length === 0) {
+        const total = await collection.countDocuments({}, 2000);
+        console.log("[chat] collection check", { count: total });
       }
     } catch (error) {
       console.log("Error querying vector search:", error);
       docContent = "";
     }
 
-    // template to pass to openai
-    const template = {
-      role: "system",
-      content: `You are Vector11, a football stats assistant. Always use the retrieved context (from the vector database) as the primary source of truth. If the context answers the question, summarize it clearly. If the context is partial, combine
-  it with your football knowledge and explicitly label which parts are from context vs. general knowledge. If there is no relevant context, say so and answer from general knowledge. If the user asks for standings, top teams, rankings, or league tables, return a markdown table first, then a short "Quick read" summary. Be concise, tactical, and data-aware. Here is the context: ${docContent}`,
-    };
+    // Convert messages to LangChain format
+    const docsFound = relevantDocs?.length ?? 0;
+    const systemMessage = new SystemMessage(`You are Vector11, a football stats assistant.
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-5-mini",
-      messages: [template, ...chatMessages],
+## Instructions
+- Use the RETRIEVED CONTEXT below as your primary source of truth.
+- If the context answers the question, summarize it clearly and cite source numbers like [1], [2].
+- If the context is partial, supplement with your general football knowledge and label which parts come from context vs. general knowledge.
+- If there is no relevant context, say so and answer from general knowledge.
+- If the user asks for standings, top teams, rankings, or league tables AND the context contains actual data for it, return a markdown table first, then a short "Quick read" summary. NEVER generate a table if the context does not contain the actual data — instead explain what data is missing.
+- Be concise, tactical, and data-aware.
+
+## Retrieved Context (${docsFound} documents)
+${docContent || "No relevant documents found."}`);
+
+    const langchainMessages = chatMessages.map((m) =>
+      m.role === "user"
+        ? new HumanMessage(m.content)
+        : new AIMessage(m.content)
+    );
+
+    const allMessages = [systemMessage, ...langchainMessages];
+
+    const response = await chat.invoke(allMessages);
+
+    // Note: LangChain ChatOpenAI doesn't expose token usage directly in the response
+    // Token tracking for the final completion is not available without callbacks
+    const assistantMessage = response.content as string;
+    console.log("[chat] response complete", {
+      mode: multiQueryEnabled ? "multi-query" : "single-query",
+      tokensFromRetrievalOps: totalTokensUsed,
+      note: "Final completion tokens not tracked (LangChain limitation)",
     });
-
-    const assistantMessage = response.choices[0]?.message?.content ?? "";
     return Response.json({ message: assistantMessage });
   } catch (error) {
     return Response.json(
