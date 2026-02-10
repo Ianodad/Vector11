@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { DataAPIClient, DataAPIResponseError } from "@datastax/astra-db-ts";
 import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
 import OpenAI from "openai";
@@ -46,6 +47,10 @@ const MAX_SCRAPE_URLS = process.env.MAX_SCRAPE_URLS;
 const EPL_TEAM_PAGES = process.env.EPL_TEAM_PAGES;
 const EPL_TEAM_SLUGS = process.env.EPL_TEAM_SLUGS;
 const EPL_TEAMS_ENABLED = process.env.EPL_TEAMS_ENABLED;
+const STATS_CHUNK_SIZE = Number(process.env.STATS_CHUNK_SIZE) || 1500;
+const STATS_CHUNK_OVERLAP = Number(process.env.STATS_CHUNK_OVERLAP) || 200;
+const DEFAULT_CHUNK_SIZE = Number(process.env.DEFAULT_CHUNK_SIZE) || 800;
+const DEFAULT_CHUNK_OVERLAP = Number(process.env.DEFAULT_CHUNK_OVERLAP) || 150;
 
 const BLOCK_PATTERNS = [
   "/video",
@@ -211,6 +216,7 @@ type SourceItem = {
   type: SourceType;
   source: string;
   delay?: number; // Delay in seconds - CRITICAL for rate limiting
+  category?: string;
 };
 
 // Updated to 2024-25 Premier League teams
@@ -805,16 +811,24 @@ const footballDataGroups: Record<
   ],
 };
 
-const footballData: SourceItem[] = Object.values(footballDataGroups).flat();
+const footballData: SourceItem[] = Object.entries(footballDataGroups).flatMap(
+  ([groupKey, items]) =>
+    items.map((item) => ({ ...item, category: item.category ?? groupKey })),
+);
 
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN);
 const db = client.db(ASTRA_DB_API_ENDPOINT, {
   keyspace: ASTRA_DB_NAMESPACE,
 });
 
-const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 500,
-  chunkOverlap: 100,
+const statsSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: STATS_CHUNK_SIZE,
+  chunkOverlap: STATS_CHUNK_OVERLAP,
+});
+
+const defaultSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: DEFAULT_CHUNK_SIZE,
+  chunkOverlap: DEFAULT_CHUNK_OVERLAP,
 });
 
 const createCollection = async (
@@ -881,7 +895,7 @@ const loadSampleData = async (
   let failedUrls = 0;
 
   for (let i = 0; i < queue.length; i += 1) {
-    const { url, type, source, delay = 2 } = queue[i];
+    const { url, type, source, delay = 2, category = "unknown" } = queue[i];
     const baseTotal = queue.length;
     const capLabel = maxUrls !== undefined ? ` cap=${maxUrls}` : "";
     console.log(
@@ -896,6 +910,7 @@ const loadSampleData = async (
           type: "html",
           source: `${source} Article`,
           delay: 2,
+          category,
         });
       }
       await sleep(delay);
@@ -913,6 +928,7 @@ const loadSampleData = async (
           type: "html",
           source: `${source} Article`,
           delay: 2,
+          category,
         });
       }
       console.log(
@@ -965,29 +981,90 @@ const loadSampleData = async (
       continue;
     }
 
+    const splitter = isStatsSite ? statsSplitter : defaultSplitter;
     const chunks = await splitter.splitText(content);
+    const filteredChunks = chunks.filter(
+      (chunk) => chunk.trim().length >= 120 && !isLowValueContent(chunk),
+    );
+
+    if (filteredChunks.length === 0) {
+      skippedUrls += 1;
+      console.log(`Skipped ${url} (no valid chunks after filtering)`);
+      await sleep(delay);
+      continue;
+    }
+
     try {
-      for await (const chunk of chunks) {
-        if (chunk.trim().length < 120) continue;
-        if (isLowValueContent(chunk)) continue;
-        const embedding = await openai.embeddings.create({
-          model: "text-embedding-3-small",
-          input: chunk,
+      // Batch embed in groups of 100
+      const EMBED_BATCH = 100;
+      const allVectors: number[][] = [];
+      for (let b = 0; b < filteredChunks.length; b += EMBED_BATCH) {
+        const batch = filteredChunks.slice(b, b + EMBED_BATCH);
+        // Prepend contextual header for embedding (not stored in content)
+        const enriched = batch.map((c) => `[Source: ${source}]\n${c}`);
+        const embeddingRes = await openai.embeddings.create({
+          model: "text-embedding-3-large",
+          input: enriched,
           dimensions: vectorDimensions,
           encoding_format: "float",
         });
-        const vector = embedding.data[0].embedding;
-        const res = await collection.insertOne({
-          content: chunk,
-          source,
-          $vector: vector,
-        });
-        console.log(res);
-        recordsAdded += 1;
+        for (const item of embeddingRes.data) {
+          allVectors.push(item.embedding);
+        }
+        console.log(
+          `  Embedded batch ${Math.floor(b / EMBED_BATCH) + 1}/${Math.ceil(filteredChunks.length / EMBED_BATCH)} (${batch.length} chunks)`,
+        );
       }
+
+      // Batch insert in groups of 20 (Astra DB limit for vectorized collections)
+      const INSERT_BATCH = 20;
+      const scrapedAt = new Date().toISOString();
+      for (let b = 0; b < filteredChunks.length; b += INSERT_BATCH) {
+        const batchDocs = filteredChunks
+          .slice(b, b + INSERT_BATCH)
+          .map((chunk, idx) => {
+            const globalIdx = b + idx;
+            const contentHash = createHash("md5")
+              .update(chunk)
+              .digest("hex");
+            return {
+              _id: contentHash,
+              content: chunk,
+              source,
+              url,
+              category,
+              scrapedAt,
+              $vector: allVectors[globalIdx],
+            };
+          });
+
+        try {
+          const res = await collection.insertMany(batchDocs, { ordered: false });
+          recordsAdded += res.insertedCount;
+        } catch (insertErr: unknown) {
+          // insertMany with ordered:false throws on duplicates but still inserts new ones
+          if (
+            insertErr instanceof DataAPIResponseError &&
+            insertErr.message.includes("duplicate")
+          ) {
+            const inserted =
+              (insertErr as DataAPIResponseError & { partialResult?: { insertedCount?: number } })
+                .partialResult?.insertedCount ?? 0;
+            recordsAdded += inserted;
+            console.log(
+              `  Batch had duplicates, inserted ${inserted} new docs`,
+            );
+          } else {
+            throw insertErr;
+          }
+        }
+      }
+      console.log(
+        `  Inserted ${filteredChunks.length} chunks for ${url}`,
+      );
     } catch (err) {
       failedUrls += 1;
-      console.warn(`Failed to insert for ${url}:`, err);
+      console.warn(`Failed to process ${url}:`, err);
       await sleep(delay);
       continue;
     }
@@ -1194,7 +1271,12 @@ const scrapPage = async (url: string, type: SourceType): Promise<string> => {
         },
       });
       const raw = (await loader.scrape()) ?? "";
-      const cleaned = raw.replace(/\s+/g, " ").trim();
+      const cleaned = raw
+        .split("\n")
+        .map((line) => line.replace(/[ \t]+/g, " ").trim())
+        .join("\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
       if (isAccessBlockedContent(cleaned)) return "";
       return cleaned;
     } catch (error) {

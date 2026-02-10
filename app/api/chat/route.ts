@@ -103,7 +103,7 @@ export async function POST(request: Request) {
 
     //embedding
     const embeddingResponse = await openai.embeddings.create({
-      model: "text-embedding-3-small",
+      model: "text-embedding-3-large",
       input: retrievalQuery,
       encoding_format: "float",
       dimensions: EMBEDDING_DIMENSIONS,
@@ -127,7 +127,7 @@ export async function POST(request: Request) {
           sort: { $vector: embedding },
           limit: 10,
           includeSimilarity: true,
-          projection: { content: 1, source: 1 },
+          projection: { content: 1, source: 1, url: 1 },
         },
       );
 
