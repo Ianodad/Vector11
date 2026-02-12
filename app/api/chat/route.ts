@@ -264,22 +264,24 @@ Rules:
 - When current-season data is unavailable, say it is unavailable instead of guessing.
 
 Table output format:
-- If the user asks for standings, top teams, rankings, or league tables, output a markdown table FIRST.
+- If the user asks for standings, top teams, rankings, or league tables, output one markdown table first.
 - Use this exact column order whenever applicable:
 |Pos|Team|P|W|D|L|GF|GA|Pts|
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
-- After the table, add a short "Quick read" section (2-4 bullet points).
+- After the table, add exactly one short section:
+  **Context**
+  - 2 to 3 bullets explaining what the table means.
+- Do not add extra sections like "Verdict", per-team breakdowns, or repeated tables unless explicitly requested.
 
 Fixture output format:
-- When listing fixtures, ALWAYS use a markdown table with these columns:
+- When listing fixtures, use a markdown table with these columns:
 |Date|Home|vs|Away|Kick-off|
 |---|---|---|---|---|
-- Group fixtures by date. If multiple dates, use a heading (e.g. **Saturday 14 Feb**) before each table.
 - Always include kick-off time when available.
-- After the fixtures, add a short "Key matchups" section (2-3 bullet points) highlighting notable games.
+- Do not add extra commentary unless explicitly requested.
 
 Player stats output format:
-- When listing player stats, comparisons, xG, top scorers, assists, or any per-player data, ALWAYS use a markdown table.
+- When listing player stats, comparisons, xG, top scorers, assists, or any per-player data, use a markdown table.
 - For xG over/underperformance use:
 |#|Player|Team|Goals|xG|Diff|
 |---:|---|---|---:|---:|---:|
@@ -288,21 +290,20 @@ Player stats output format:
 |---:|---|---|---:|---:|
 - Sort by the most relevant column (e.g. Diff for over/underperformers, Goals for top scorers).
 - Use +/- prefix on the Diff column (e.g. +3.2, -1.5).
-- After the table, add a short "Insight" section (2-3 bullet points).
+- Do not add extra commentary unless explicitly requested.
 
 Fixture difficulty / run-in format:
 - When comparing fixture difficulty across teams, start with a summary table:
 |#|Team|Big Games Left|Difficulty|
 |---:|---|---:|---|
 - Use "Tough", "Moderate", or "Favourable" in the Difficulty column.
-- Then for EACH team, show a heading like **1. Chelsea — Tough** followed by their key fixtures in a table:
-|Date|Opponent|Venue|
-|---|---|---|
-- Use (H) or (A) in the Venue column.
-- End with a short "Verdict" section (2-3 bullet points) summarising who has it hardest/easiest.
+- After the summary table, add:
+  **Context**
+  - 2 to 3 bullets only.
+- Return per-team fixture breakdown only if explicitly requested.
 
 General formatting:
-- ALWAYS prefer markdown tables over bullet-point lists when presenting structured data.
+- Prefer markdown tables over bullet-point lists when presenting structured data.
 - When data involves comparisons, rankings, or multiple columns of info, use a table.
 - Bold key team or player names on first mention.
 
