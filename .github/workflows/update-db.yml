@@ -1,0 +1,47 @@
+name: Update Vector Database
+
+on:
+  schedule:
+    # Every Monday at 3:00 AM UTC
+    - cron: "0 3 * * 1"
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+jobs:
+  update-db:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64
+
+      - name: Run full database seed
+        env:
+          ASTRA_DB_NAMESPACE: ${{ secrets.ASTRA_DB_NAMESPACE }}
+          ASTRA_DB_COLLECTION: ${{ secrets.ASTRA_DB_COLLECTION }}
+          ASTRA_DB_API_ENDPOINT: ${{ secrets.ASTRA_DB_API_ENDPOINT }}
+          ASTRA_DB_APPLICATION_TOKEN: ${{ secrets.ASTRA_DB_APPLICATION_TOKEN }}
+          OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
+          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1000' }}
+          ALLOW_COLLECTION_RECREATE: "false"
+          EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
+          EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
+          MAX_SCRAPE_URLS: ${{ vars.MAX_SCRAPE_URLS || '' }}
+        run: npx tsx scripts/loadDb.ts

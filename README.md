@@ -34,6 +34,10 @@ ASTRA_DB_API_ENDPOINT=
 ASTRA_DB_APPLICATION_TOKEN=
 OPEN_API_KEY=
 EMBEDDING_DIMENSIONS=1000
+ALLOW_COLLECTION_RECREATE=false
+FETCH_TIMEOUT_MS=15000
+RETRY_ATTEMPTS=3
+RETRY_BASE_DELAY_MS=1000
 ```
 
 3) (Optional) Seed the vector database
@@ -69,3 +73,9 @@ Open `http://localhost:3000` to use the app.
 ## Notes
 - The seed script uses Puppeteer; ensure it can run in your environment.
 - Update the sources list in `scripts/loadDb.ts` to expand coverage.
+
+## Ingestion Environment Variables
+- `ALLOW_COLLECTION_RECREATE` - when `true`, the seeder can drop and recreate the Astra collection if vector dimensions mismatch. Default is safe (`false`).
+- `FETCH_TIMEOUT_MS` - timeout for RSS/feed fetch requests in milliseconds.
+- `RETRY_ATTEMPTS` - number of retry attempts for transient failures (scrape, embed, insert, feed fetch).
+- `RETRY_BASE_DELAY_MS` - base retry delay in milliseconds; backoff is exponential (`base * 2^(attempt-1)`).

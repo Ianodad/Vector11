@@ -114,41 +114,72 @@ export async function POST(request: Request) {
       configured: EMBEDDING_DIMENSIONS,
     });
 
-    //vector search
+    //vector search — parent-child retrieval strategy
     try {
       const collection = db.collection(ASTRA_DB_COLLECTION);
-      console.log("[chat] vector search", {
+      console.log("[chat] vector search (parent-child)", {
         keyspace: ASTRA_DB_NAMESPACE,
         collection: ASTRA_DB_COLLECTION,
       });
+
+      // Step 1: Search child chunks for precise vector matching
       const cursor = collection.find(
-        {},
+        { type: "child" },
         {
           sort: { $vector: embedding },
           limit: 10,
           includeSimilarity: true,
-          projection: { content: 1, source: 1, url: 1 },
+          projection: { parentId: 1, content: 1, source: 1, url: 1 },
         },
       );
-
-      const documents = await cursor.toArray();
-      console.log("[chat] vector search results", {
-        count: documents.length,
-        sampleKeys: documents[0] ? Object.keys(documents[0]) : [],
+      const childDocs = await cursor.toArray();
+      console.log("[chat] child search results", {
+        count: childDocs.length,
+        sampleKeys: childDocs[0] ? Object.keys(childDocs[0]) : [],
       });
-      const docsMap = documents.map((doc) => doc.content);
 
-      docContent = JSON.stringify(docsMap);
+      // Step 2: Fetch parent chunks for rich LLM context
+      const parentIds = Array.from(
+        new Set(
+          childDocs
+            .map((d) => d.parentId as string | undefined)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
 
-      if (documents.length === 0) {
+      let parents: Array<Record<string, unknown>> = [];
+      if (parentIds.length > 0) {
+        parents = await collection
+          .find(
+            { _id: { $in: parentIds } },
+            { projection: { content: 1, source: 1, url: 1 } },
+          )
+          .toArray();
+      }
+      console.log("[chat] parent fetch results", {
+        uniqueParentIds: parentIds.length,
+        parentsFetched: parents.length,
+      });
+
+      // Step 3: Use parent content as LLM context (richer than child content)
+      if (parents.length > 0) {
+        const parentContent = parents.map((doc) => doc.content);
+        docContent = JSON.stringify(parentContent);
+      } else if (childDocs.length > 0) {
+        // Fallback: use child content if parents are missing (orphaned children)
+        console.log("[chat] fallback: using child content (no parents found)");
+        const childContent = childDocs.map((d) => d.content);
+        docContent = JSON.stringify(childContent);
+      }
+
+      if (childDocs.length === 0) {
         const total = await collection.countDocuments({}, 2000);
         const fallbackDocs = await collection.find({}, { limit: 1 }).toArray();
         console.log("[chat] collection check", {
           countUpperBound: 2000,
           count: total,
           sampleKeys: fallbackDocs[0] ? Object.keys(fallbackDocs[0]) : [],
-          hasVectorField: Boolean(fallbackDocs[0]?.vector),
-          hasDollarVectorField: Boolean(fallbackDocs[0]?.$vector),
+          hasTypeField: Boolean(fallbackDocs[0]?.type),
         });
       }
     } catch (error) {

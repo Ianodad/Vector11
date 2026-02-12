@@ -1,4 +1,7 @@
+//app/scripts/loadDb.ts
 import { createHash } from "crypto";
+import { mkdir, writeFile } from "fs/promises";
+import { join } from "path";
 import { DataAPIClient, DataAPIResponseError } from "@datastax/astra-db-ts";
 import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
 import OpenAI from "openai";
@@ -43,6 +46,7 @@ const ASTRA_DB_APPLICATION_TOKEN = requiredEnv(
 const OPEN_API_KEY = requiredEnv(process.env.OPEN_API_KEY, "OPEN_API_KEY");
 const DEFAULT_VECTOR_DIMENSIONS =
   Number(process.env.EMBEDDING_DIMENSIONS) || 1000;
+const ALLOW_COLLECTION_RECREATE = process.env.ALLOW_COLLECTION_RECREATE;
 const MAX_SCRAPE_URLS = process.env.MAX_SCRAPE_URLS;
 const EPL_TEAM_PAGES = process.env.EPL_TEAM_PAGES;
 const EPL_TEAM_SLUGS = process.env.EPL_TEAM_SLUGS;
@@ -51,6 +55,13 @@ const STATS_CHUNK_SIZE = Number(process.env.STATS_CHUNK_SIZE) || 1500;
 const STATS_CHUNK_OVERLAP = Number(process.env.STATS_CHUNK_OVERLAP) || 200;
 const DEFAULT_CHUNK_SIZE = Number(process.env.DEFAULT_CHUNK_SIZE) || 800;
 const DEFAULT_CHUNK_OVERLAP = Number(process.env.DEFAULT_CHUNK_OVERLAP) || 150;
+const CHILD_CHUNK_SIZE = Number(process.env.CHILD_CHUNK_SIZE) || 400;
+const CHILD_CHUNK_OVERLAP = Number(process.env.CHILD_CHUNK_OVERLAP) || 50;
+const STATS_CHILD_CHUNK_SIZE = Number(process.env.STATS_CHILD_CHUNK_SIZE) || 400;
+const STATS_CHILD_CHUNK_OVERLAP = Number(process.env.STATS_CHILD_CHUNK_OVERLAP) || 50;
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS) || 15000;
+const RETRY_ATTEMPTS = Number(process.env.RETRY_ATTEMPTS) || 3;
+const RETRY_BASE_DELAY_MS = Number(process.env.RETRY_BASE_DELAY_MS) || 1000;
 
 const BLOCK_PATTERNS = [
   "/video",
@@ -271,6 +282,38 @@ const isEnabled = (value: string | undefined): boolean => {
 
 const sleep = (seconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+
+const sleepMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error) return error.message;
+  return String(error);
+};
+
+const withRetry = async <T>(
+  operationName: string,
+  fn: () => Promise<T>,
+  attempts = RETRY_ATTEMPTS,
+): Promise<T> => {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === attempts) break;
+      const delayMs = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      console.warn(
+        `[retry] ${operationName} failed (attempt ${attempt}/${attempts}): ${getErrorMessage(error)}. Retrying in ${delayMs}ms`,
+      );
+      await sleepMs(delayMs);
+    }
+  }
+
+  throw lastError;
+};
 
 // MAXIMIZED & OPTIMIZED DATA SOURCES
 // Based on research - removed: WhoScored, Medium, UEFA.com, Goal.com
@@ -831,6 +874,16 @@ const defaultSplitter = new RecursiveCharacterTextSplitter({
   chunkOverlap: DEFAULT_CHUNK_OVERLAP,
 });
 
+const statsChildSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: STATS_CHILD_CHUNK_SIZE,
+  chunkOverlap: STATS_CHILD_CHUNK_OVERLAP,
+});
+
+const defaultChildSplitter = new RecursiveCharacterTextSplitter({
+  chunkSize: CHILD_CHUNK_SIZE,
+  chunkOverlap: CHILD_CHUNK_OVERLAP,
+});
+
 const createCollection = async (
   similarityMetric: SimilarityMetric,
 ): Promise<number> => {
@@ -856,8 +909,13 @@ const createCollection = async (
         );
       }
       if (existingDimensions !== DEFAULT_VECTOR_DIMENSIONS) {
+        if (!isEnabled(ALLOW_COLLECTION_RECREATE)) {
+          throw new Error(
+            `Collection '${ASTRA_DB_COLLECTION}' dimension mismatch: existing=${existingDimensions}, requested=${DEFAULT_VECTOR_DIMENSIONS}. Set ALLOW_COLLECTION_RECREATE=true to recreate the collection.`,
+          );
+        }
         console.log(
-          `Dropping collection with ${existingDimensions} dimensions, recreating with ${DEFAULT_VECTOR_DIMENSIONS}`,
+          `Recreating collection with ${DEFAULT_VECTOR_DIMENSIONS} dimensions (existing was ${existingDimensions})`,
         );
         await db.dropCollection(ASTRA_DB_COLLECTION);
         const res = await db.createCollection(ASTRA_DB_COLLECTION, {
@@ -884,12 +942,15 @@ const loadSampleData = async (
   processedUrls: number;
   processedUrlList: string[];
   recordsAdded: number;
+  totalEmbeddingTokens: number;
 }> => {
   const collection = db.collection(ASTRA_DB_COLLECTION);
   const queue: SourceItem[] = [...footballData];
+  const seenUrls = new Set<string>();
   const maxUrls = resolveMaxUrls(MAX_SCRAPE_URLS);
   let processedUrls = 0;
   let recordsAdded = 0;
+  let totalEmbeddingTokens = 0;
   const processedUrlList: string[] = [];
   let skippedUrls = 0;
   let failedUrls = 0;
@@ -903,8 +964,12 @@ const loadSampleData = async (
     );
 
     if (type === "rss") {
-      const links = await extractRssLinks(url);
+      const links = await withRetry(`extractRssLinks:${url}`, () =>
+        extractRssLinks(url),
+      );
       for (const link of links) {
+        if (seenUrls.has(link)) continue;
+        seenUrls.add(link);
         queue.push({
           url: link,
           type: "html",
@@ -920,9 +985,13 @@ const loadSampleData = async (
     if (maxUrls !== undefined && processedUrls >= maxUrls) break;
 
     if (isBbcTeamPage(url)) {
-      const links = await extractHtmlLinks(url);
+      const links = await withRetry(`extractHtmlLinks:${url}`, () =>
+        extractHtmlLinks(url),
+      );
       const filtered = filterBbcTeamLinks(url, links);
       for (const link of filtered) {
+        if (seenUrls.has(link)) continue;
+        seenUrls.add(link);
         queue.push({
           url: link,
           type: "html",
@@ -944,7 +1013,9 @@ const loadSampleData = async (
       continue;
     }
 
-    const content = await scrapPage(url, type);
+    const content = await withRetry(`scrapPage:${url}`, () =>
+      scrapPage(url, type),
+    );
 
     // Debug logging for stats sites
     const isStatsSite =
@@ -981,59 +1052,146 @@ const loadSampleData = async (
       continue;
     }
 
-    const splitter = isStatsSite ? statsSplitter : defaultSplitter;
-    const chunks = await splitter.splitText(content);
-    const filteredChunks = chunks.filter(
+    // --- Parent-child chunking strategy ---
+    // Step 1: Split into parent chunks
+    const parentSplitter = isStatsSite ? statsSplitter : defaultSplitter;
+    const parentChunks = await parentSplitter.splitText(content);
+    const filteredParents = parentChunks.filter(
       (chunk) => chunk.trim().length >= 120 && !isLowValueContent(chunk),
     );
 
-    if (filteredChunks.length === 0) {
+    if (filteredParents.length === 0) {
       skippedUrls += 1;
-      console.log(`Skipped ${url} (no valid chunks after filtering)`);
+      console.log(`Skipped ${url} (no valid parent chunks after filtering)`);
+      await sleep(delay);
+      continue;
+    }
+
+    // Step 2: Split each parent into child chunks
+    const childSplitter = isStatsSite ? statsChildSplitter : defaultChildSplitter;
+    const scrapedAt = new Date().toISOString();
+
+    interface ParentRecord {
+      _id: string;
+      content: string;
+      source: string;
+      url: string;
+      category: string;
+      scrapedAt: string;
+      type: "parent";
+    }
+    interface ChildRecord {
+      _id: string;
+      content: string;
+      parentId: string;
+      source: string;
+      url: string;
+      category: string;
+      scrapedAt: string;
+      type: "child";
+      $vector?: number[];
+    }
+
+    const parentDocs: ParentRecord[] = [];
+    const childTexts: string[] = [];
+    const childMeta: { parentId: string }[] = [];
+
+    for (const parentChunk of filteredParents) {
+      const parentId = createHash("md5").update(parentChunk).digest("hex");
+      parentDocs.push({
+        _id: parentId,
+        content: parentChunk,
+        source,
+        url,
+        category,
+        scrapedAt,
+        type: "parent",
+      });
+
+      const children = await childSplitter.splitText(parentChunk);
+      const filteredChildren = children.filter(
+        (c) => c.trim().length >= 80 && !isLowValueContent(c),
+      );
+      for (const childChunk of filteredChildren) {
+        childTexts.push(childChunk);
+        childMeta.push({ parentId });
+      }
+    }
+
+    if (childTexts.length === 0) {
+      skippedUrls += 1;
+      console.log(`Skipped ${url} (no valid child chunks after filtering)`);
       await sleep(delay);
       continue;
     }
 
     try {
-      // Batch embed in groups of 100
+      // Step 3: Batch embed ALL child chunks
       const EMBED_BATCH = 100;
       const allVectors: number[][] = [];
-      for (let b = 0; b < filteredChunks.length; b += EMBED_BATCH) {
-        const batch = filteredChunks.slice(b, b + EMBED_BATCH);
-        // Prepend contextual header for embedding (not stored in content)
+      for (let b = 0; b < childTexts.length; b += EMBED_BATCH) {
+        const batch = childTexts.slice(b, b + EMBED_BATCH);
         const enriched = batch.map((c) => `[Source: ${source}]\n${c}`);
-        const embeddingRes = await openai.embeddings.create({
-          model: "text-embedding-3-large",
-          input: enriched,
-          dimensions: vectorDimensions,
-          encoding_format: "float",
-        });
+        const embeddingRes = await withRetry(`embed:${url}:batch:${b}`, () =>
+          openai.embeddings.create({
+            model: "text-embedding-3-large",
+            input: enriched,
+            dimensions: vectorDimensions,
+            encoding_format: "float",
+          }),
+        );
         for (const item of embeddingRes.data) {
           allVectors.push(item.embedding);
         }
+        const batchTokens = embeddingRes.usage?.total_tokens ?? 0;
+        totalEmbeddingTokens += batchTokens;
         console.log(
-          `  Embedded batch ${Math.floor(b / EMBED_BATCH) + 1}/${Math.ceil(filteredChunks.length / EMBED_BATCH)} (${batch.length} chunks)`,
+          `  Embedded child batch ${Math.floor(b / EMBED_BATCH) + 1}/${Math.ceil(childTexts.length / EMBED_BATCH)} (${batch.length} chunks, ${batchTokens} tokens)`,
         );
       }
 
-      // Batch insert in groups of 20 (Astra DB limit for vectorized collections)
+      // Step 4: Batch insert parent docs (no $vector)
+      // No withRetry — duplicate "already exists" errors are expected and handled
       const INSERT_BATCH = 20;
-      const scrapedAt = new Date().toISOString();
-      for (let b = 0; b < filteredChunks.length; b += INSERT_BATCH) {
-        const batchDocs = filteredChunks
+      for (let b = 0; b < parentDocs.length; b += INSERT_BATCH) {
+        const batch = parentDocs.slice(b, b + INSERT_BATCH);
+        try {
+          const res = await collection.insertMany(batch, { ordered: false });
+          recordsAdded += res.insertedCount;
+        } catch (insertErr: unknown) {
+          const msg = insertErr instanceof Error ? insertErr.message : "";
+          if (msg.includes("already exists") || msg.includes("duplicate")) {
+            const inserted =
+              (insertErr as Error & { partialResult?: { insertedCount?: number } })
+                .partialResult?.insertedCount ?? 0;
+            recordsAdded += inserted;
+            console.log(
+              `  Parent batch had duplicates, inserted ${inserted} new docs`,
+            );
+          } else {
+            throw insertErr;
+          }
+        }
+      }
+
+      // Step 5: Batch insert child docs (with $vector and parentId)
+      for (let b = 0; b < childTexts.length; b += INSERT_BATCH) {
+        const batchDocs: ChildRecord[] = childTexts
           .slice(b, b + INSERT_BATCH)
           .map((chunk, idx) => {
             const globalIdx = b + idx;
-            const contentHash = createHash("md5")
-              .update(chunk)
+            const childId = createHash("md5")
+              .update(`${childMeta[globalIdx].parentId}|${chunk}`)
               .digest("hex");
             return {
-              _id: contentHash,
+              _id: childId,
               content: chunk,
+              parentId: childMeta[globalIdx].parentId,
               source,
               url,
               category,
               scrapedAt,
+              type: "child" as const,
               $vector: allVectors[globalIdx],
             };
           });
@@ -1042,17 +1200,14 @@ const loadSampleData = async (
           const res = await collection.insertMany(batchDocs, { ordered: false });
           recordsAdded += res.insertedCount;
         } catch (insertErr: unknown) {
-          // insertMany with ordered:false throws on duplicates but still inserts new ones
-          if (
-            insertErr instanceof DataAPIResponseError &&
-            insertErr.message.includes("duplicate")
-          ) {
+          const msg = insertErr instanceof Error ? insertErr.message : "";
+          if (msg.includes("already exists") || msg.includes("duplicate")) {
             const inserted =
-              (insertErr as DataAPIResponseError & { partialResult?: { insertedCount?: number } })
+              (insertErr as Error & { partialResult?: { insertedCount?: number } })
                 .partialResult?.insertedCount ?? 0;
             recordsAdded += inserted;
             console.log(
-              `  Batch had duplicates, inserted ${inserted} new docs`,
+              `  Child batch had duplicates, inserted ${inserted} new docs`,
             );
           } else {
             throw insertErr;
@@ -1060,7 +1215,7 @@ const loadSampleData = async (
         }
       }
       console.log(
-        `  Inserted ${filteredChunks.length} chunks for ${url}`,
+        `  Inserted ${parentDocs.length} parents + ${childTexts.length} children for ${url}`,
       );
     } catch (err) {
       failedUrls += 1;
@@ -1078,7 +1233,7 @@ const loadSampleData = async (
     await sleep(delay);
   }
 
-  return { processedUrls, processedUrlList, recordsAdded };
+  return { processedUrls, processedUrlList, recordsAdded, totalEmbeddingTokens };
 };
 
 const scrapPage = async (url: string, type: SourceType): Promise<string> => {
@@ -1291,13 +1446,16 @@ const scrapPage = async (url: string, type: SourceType): Promise<string> => {
 };
 
 const extractRssLinks = async (url: string): Promise<string[]> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   const res = await fetch(url, {
     headers: {
       "user-agent":
         "Mozilla/5.0 (compatible; FootballRAGBot/1.0; +https://example.com/bot)",
       accept: "text/html,application/xml,text/xml,application/json,*/*",
     },
-  });
+    signal: controller.signal,
+  }).finally(() => clearTimeout(timeout));
 
   if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
 
@@ -1495,18 +1653,53 @@ const seed = async () => {
   console.log(`- Max URLs: ${MAX_SCRAPE_URLS || "Unlimited"}\n`);
 
   const vectorDimensions = await createCollection("dot_product");
-  const { processedUrls, processedUrlList, recordsAdded } =
+  const { processedUrls, processedUrlList, recordsAdded, totalEmbeddingTokens } =
     await loadSampleData(vectorDimensions);
   const durationMs = Date.now() - startedAt;
 
+  // text-embedding-3-large pricing: $0.13 per 1M tokens
+  const estimatedCost = (totalEmbeddingTokens / 1_000_000) * 0.13;
+
   console.log("\n✅ Seed complete");
-  console.log(`⏱️  Time taken: ${Math.round(durationMs / 1000)}s`);
+  const totalSecs = Math.floor(durationMs / 1000);
+  const hh = String(Math.floor(totalSecs / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((totalSecs % 3600) / 60)).padStart(2, "0");
+  const ss = String(totalSecs % 60).padStart(2, "0");
+  console.log(`⏱️  Time taken: ${hh}:${mm}:${ss}`);
   console.log(`📄 Parsed URLs: ${processedUrls}`);
   console.log(`💾 Records added: ${recordsAdded}`);
+  console.log(`🔤 Embedding tokens used: ${totalEmbeddingTokens.toLocaleString()}`);
+  console.log(`💰 Estimated embedding cost: $${estimatedCost.toFixed(4)}`);
   console.log("\n📋 Parsed URL list:");
   for (const url of processedUrlList) {
     console.log(`   - ${url}`);
   }
+
+  const dateStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const logLines = [
+    "✅ Seed complete",
+    `⏱️  Time taken: ${hh}:${mm}:${ss}`,
+    `📄 Parsed URLs: ${processedUrls}`,
+    `💾 Records added: ${recordsAdded}`,
+    `🔤 Embedding tokens used: ${totalEmbeddingTokens.toLocaleString()}`,
+    `💰 Estimated embedding cost: $${estimatedCost.toFixed(4)}`,
+    "",
+    "📋 Parsed URL list:",
+    ...processedUrlList.map((url) => `   - ${url}`),
+  ];
+
+  try {
+    const logDir = join(process.cwd(), "scripts", "logs");
+    await mkdir(logDir, { recursive: true });
+    const logFilePath = join(logDir, `seed-summary-${dateStamp}.log`);
+    await writeFile(logFilePath, `${logLines.join("\n")}\n`, "utf8");
+    console.log(`📝 Summary log written: ${logFilePath}`);
+  } catch (error) {
+    console.warn("⚠️  Failed to write seed summary log:", getErrorMessage(error));
+  }
 };
 
-seed();
+seed().catch((error: unknown) => {
+  console.error("Seed failed:", error);
+  process.exitCode = 1;
+});
