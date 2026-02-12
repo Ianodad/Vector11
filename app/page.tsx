@@ -227,11 +227,65 @@ export default function Home() {
                         <ReactMarkdown
                           remarkPlugins={[remarkGfm]}
                           components={{
-                            table: ({ children }) => (
-                              <div className="table-wrap">
-                                <table>{children}</table>
-                              </div>
-                            ),
+                            table: ({ children, node }) => {
+                              const extractText = (n: unknown): string => {
+                                if (!n || typeof n !== "object") return "";
+                                const obj = n as { value?: string; children?: unknown[] };
+                                if (typeof obj.value === "string") return obj.value;
+                                return (obj.children ?? []).map(extractText).join(" ");
+                              };
+                              const thead = (node as { children?: unknown[] })?.children?.[0];
+                              const headerText = extractText(thead);
+                              let cls = "";
+                              if (/\bvs\b/i.test(headerText)) {
+                                cls = "fixture-table";
+                              } else if (/\bVenue\b/i.test(headerText)) {
+                                cls = "fixture-table";
+                              } else if (/\bDifficulty\b/i.test(headerText)) {
+                                cls = "difficulty-table";
+                              } else if (/\bxG\b|\bDiff\b/.test(headerText)) {
+                                cls = "player-stats-table";
+                              } else if (/\bGoals\b.*\bAssists\b/.test(headerText)) {
+                                cls = "player-stats-table";
+                              } else if (/\bPts\b/.test(headerText)) {
+                                cls = "standings-table";
+                              }
+                              return (
+                                <div className={`table-wrap ${cls}`}>
+                                  <table>{children}</table>
+                                </div>
+                              );
+                            },
+                            td: ({ children }) => {
+                              const text = String(children).trim();
+                              if (text === "vs") {
+                                return <td className="vs-cell">{children}</td>;
+                              }
+                              if (/^[+-]\d/.test(text)) {
+                                const isPositive = text.startsWith("+");
+                                return (
+                                  <td className={isPositive ? "diff-positive" : "diff-negative"}>
+                                    {children}
+                                  </td>
+                                );
+                              }
+                              if (text === "Tough") {
+                                return <td className="diff-tough">{children}</td>;
+                              }
+                              if (text === "Moderate") {
+                                return <td className="diff-moderate">{children}</td>;
+                              }
+                              if (text === "Favourable") {
+                                return <td className="diff-favourable">{children}</td>;
+                              }
+                              if (/^\(A\)$/.test(text)) {
+                                return <td className="venue-away">{children}</td>;
+                              }
+                              if (/^\(H\)$/.test(text)) {
+                                return <td className="venue-home">{children}</td>;
+                              }
+                              return <td>{children}</td>;
+                            },
                           }}
                         >
                           {message.content}

@@ -27,6 +27,12 @@ const ASTRA_DB_APPLICATION_TOKEN = requiredEnv(
 );
 const OPEN_API_KEY = requiredEnv(process.env.OPEN_API_KEY, "OPEN_API_KEY");
 const EMBEDDING_DIMENSIONS = Number(process.env.EMBEDDING_DIMENSIONS) || 1000;
+const RATE_LIMIT_WINDOW_MS =
+  Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
+const MAX_REQUESTS_PER_WINDOW =
+  Number(process.env.MAX_REQUESTS_PER_WINDOW) || 12;
+const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS) || 600;
+const MAX_MESSAGES_PER_REQUEST = Number(process.env.MAX_MESSAGES_PER_REQUEST) || 20;
 
 const openai = new OpenAI({
   apiKey: OPEN_API_KEY,
@@ -50,8 +56,50 @@ const db = client.db(ASTRA_DB_API_ENDPOINT, {
   keyspace: ASTRA_DB_NAMESPACE,
 });
 
+const requestBuckets = new Map<string, number[]>();
+
+const getClientIp = (request: Request): string => {
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  if (forwardedFor) return forwardedFor.split(",")[0].trim();
+  const realIp = request.headers.get("x-real-ip");
+  if (realIp) return realIp.trim();
+  return "unknown";
+};
+
+const getRateLimitStatus = (key: string): { allowed: boolean; retryAfterMs: number } => {
+  const now = Date.now();
+  const cutoff = now - RATE_LIMIT_WINDOW_MS;
+  const recent = (requestBuckets.get(key) ?? []).filter((ts) => ts > cutoff);
+
+  if (recent.length >= MAX_REQUESTS_PER_WINDOW) {
+    const oldest = recent[0] ?? now;
+    const retryAfterMs = Math.max(1000, RATE_LIMIT_WINDOW_MS - (now - oldest));
+    requestBuckets.set(key, recent);
+    return { allowed: false, retryAfterMs };
+  }
+
+  recent.push(now);
+  requestBuckets.set(key, recent);
+  return { allowed: true, retryAfterMs: 0 };
+};
+
 export async function POST(request: Request) {
   try {
+    const clientIp = getClientIp(request);
+    const rateLimit = getRateLimitStatus(clientIp);
+    if (!rateLimit.allowed) {
+      const retryAfterSeconds = Math.ceil(rateLimit.retryAfterMs / 1000);
+      return Response.json(
+        {
+          error: `Too many requests. Try again in about ${retryAfterSeconds}s.`,
+        },
+        {
+          status: 429,
+          headers: { "Retry-After": String(retryAfterSeconds) },
+        },
+      );
+    }
+
     const todayIso = new Date().toISOString().slice(0, 10);
     const currentEuropeanSeason = getCurrentEuropeanSeason();
     console.log("[chat] request received");
@@ -66,9 +114,10 @@ export async function POST(request: Request) {
           )
           .map((message) => ({
             role: message.role,
-            content: message.content.trim(),
+            content: message.content.trim().slice(0, MAX_INPUT_CHARS),
           }))
           .filter((message) => message.content.length > 0)
+          .slice(-MAX_MESSAGES_PER_REQUEST)
       : [];
     const lastMessage = chatMessages[chatMessages.length - 1]?.content;
 
@@ -220,6 +269,42 @@ Table output format:
 |Pos|Team|P|W|D|L|GF|GA|Pts|
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
 - After the table, add a short "Quick read" section (2-4 bullet points).
+
+Fixture output format:
+- When listing fixtures, ALWAYS use a markdown table with these columns:
+|Date|Home|vs|Away|Kick-off|
+|---|---|---|---|---|
+- Group fixtures by date. If multiple dates, use a heading (e.g. **Saturday 14 Feb**) before each table.
+- Always include kick-off time when available.
+- After the fixtures, add a short "Key matchups" section (2-3 bullet points) highlighting notable games.
+
+Player stats output format:
+- When listing player stats, comparisons, xG, top scorers, assists, or any per-player data, ALWAYS use a markdown table.
+- For xG over/underperformance use:
+|#|Player|Team|Goals|xG|Diff|
+|---:|---|---|---:|---:|---:|
+- For top scorers / assists use:
+|#|Player|Team|Goals|Assists|
+|---:|---|---|---:|---:|
+- Sort by the most relevant column (e.g. Diff for over/underperformers, Goals for top scorers).
+- Use +/- prefix on the Diff column (e.g. +3.2, -1.5).
+- After the table, add a short "Insight" section (2-3 bullet points).
+
+Fixture difficulty / run-in format:
+- When comparing fixture difficulty across teams, start with a summary table:
+|#|Team|Big Games Left|Difficulty|
+|---:|---|---:|---|
+- Use "Tough", "Moderate", or "Favourable" in the Difficulty column.
+- Then for EACH team, show a heading like **1. Chelsea — Tough** followed by their key fixtures in a table:
+|Date|Opponent|Venue|
+|---|---|---|
+- Use (H) or (A) in the Venue column.
+- End with a short "Verdict" section (2-3 bullet points) summarising who has it hardest/easiest.
+
+General formatting:
+- ALWAYS prefer markdown tables over bullet-point lists when presenting structured data.
+- When data involves comparisons, rankings, or multiple columns of info, use a table.
+- Bold key team or player names on first mention.
 
 Here is the retrieved context:
 ${docContent}`,
