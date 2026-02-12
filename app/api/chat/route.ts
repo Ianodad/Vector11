@@ -1,6 +1,6 @@
 // app/api/chat/route.ts
 import OpenAI from "openai";
-import { DataAPIClient, vector } from "@datastax/astra-db-ts";
+import { DataAPIClient } from "@datastax/astra-db-ts";
 
 const requiredEnv = (value: string | undefined, name: string): string => {
   if (!value) {
@@ -32,6 +32,14 @@ const openai = new OpenAI({
   apiKey: OPEN_API_KEY,
 });
 
+const getCurrentEuropeanSeason = (date: Date = new Date()): string => {
+  const month = date.getUTCMonth() + 1;
+  const year = date.getUTCFullYear();
+  const startYear = month >= 7 ? year : year - 1;
+  const endYearShort = String((startYear + 1) % 100).padStart(2, "0");
+  return `${startYear}-${endYearShort}`;
+};
+
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN, {
   timeoutDefaults: {
     requestTimeoutMs: 20000,
@@ -44,6 +52,8 @@ const db = client.db(ASTRA_DB_API_ENDPOINT, {
 
 export async function POST(request: Request) {
   try {
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const currentEuropeanSeason = getCurrentEuropeanSeason();
     console.log("[chat] request received");
     const { messages } = await request.json();
     const chatMessages = Array.isArray(messages)
@@ -88,7 +98,7 @@ export async function POST(request: Request) {
           {
             role: "system",
             content:
-              "Rewrite the user's latest message as a standalone football stats search query. Include all relevant entities (players, teams, competitions, stats, dates) mentioned in the conversation. Output ONLY the rewritten query, nothing else.",
+              `Rewrite the user's latest message as a standalone football stats search query. Include all relevant entities (players, teams, competitions, stats, dates) mentioned in the conversation. If season is not explicitly stated, assume current European season ${currentEuropeanSeason}. Output ONLY the rewritten query, nothing else.`,
           },
           { role: "user", content: recentContext },
         ],
@@ -190,8 +200,29 @@ export async function POST(request: Request) {
     // template to pass to openai
     const template = {
       role: "system",
-      content: `You are Vector11, a football stats assistant. Always use the retrieved context (from the vector database) as the primary source of truth. If the context answers the question, summarize it clearly. If the context is partial, combine
-  it with your football knowledge and explicitly label which parts are from context vs. general knowledge. If there is no relevant context, say so and answer from general knowledge. If the user asks for standings, top teams, rankings, or league tables, return a markdown table first, then a short "Quick read" summary. Be concise, tactical, and data-aware. Here is the context: ${docContent}`,
+      content: `You are Vector11, a football stats assistant.
+
+Date context:
+- Today (UTC): ${todayIso}
+- Current European season baseline: ${currentEuropeanSeason}
+
+Rules:
+- Always use retrieved context from the vector database as the primary source of truth.
+- If the context is partial, combine it with general football knowledge and clearly label what is from context vs general knowledge.
+- If no relevant context is available, state that clearly, then answer from general knowledge.
+- Default to CURRENT season/year when user asks "current", "latest", "now", or does not specify a season.
+- If user provides a historical table (for example last season), treat it as historical and do not present it as current.
+- When current-season data is unavailable, say it is unavailable instead of guessing.
+
+Table output format:
+- If the user asks for standings, top teams, rankings, or league tables, output a markdown table FIRST.
+- Use this exact column order whenever applicable:
+|Pos|Team|P|W|D|L|GF|GA|Pts|
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+- After the table, add a short "Quick read" section (2-4 bullet points).
+
+Here is the retrieved context:
+${docContent}`,
     };
 
     const response = await openai.chat.completions.create({
@@ -201,7 +232,7 @@ export async function POST(request: Request) {
 
     const assistantMessage = response.choices[0]?.message?.content ?? "";
     return Response.json({ message: assistantMessage });
-  } catch (error) {
+  } catch {
     return Response.json(
       { error: "Failed to generate response." },
       { status: 500 },
