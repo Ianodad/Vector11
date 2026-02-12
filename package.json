@@ -22,6 +22,8 @@
     "puppeteer": "^24.35.0",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
     "ts-node": "^10.9.2"
   },
   "devDependencies": {

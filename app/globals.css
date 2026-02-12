@@ -24,3 +24,103 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* ── Vector11 prose: markdown inside assistant bubbles ── */
+.prose-v11 {
+  font-size: 0.875rem;
+  line-height: 1.625;
+}
+
+.prose-v11 p {
+  margin: 0.5em 0;
+}
+
+.prose-v11 p:first-child {
+  margin-top: 0;
+}
+
+.prose-v11 p:last-child {
+  margin-bottom: 0;
+}
+
+.prose-v11 strong {
+  font-weight: 600;
+}
+
+.prose-v11 ul,
+.prose-v11 ol {
+  margin: 0.5em 0;
+  padding-left: 1.5em;
+}
+
+.prose-v11 li {
+  margin: 0.25em 0;
+}
+
+/* ── Tables ── */
+.prose-v11 .table-wrap {
+  overflow-x: auto;
+  margin: 0.75em 0;
+  border-radius: 0.5rem;
+  border: 1px solid #e5e5e5;
+}
+
+.prose-v11 table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.prose-v11 thead {
+  background: #0a0a0a;
+  color: #fff;
+}
+
+.prose-v11 thead th {
+  padding: 0.5rem 0.75rem;
+  font-weight: 600;
+  font-size: 0.6875rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.prose-v11 tbody tr {
+  border-top: 1px solid #e5e5e5;
+}
+
+.prose-v11 tbody tr:nth-child(even) {
+  background: #fafafa;
+}
+
+.prose-v11 tbody tr:hover {
+  background: #ecfdf5;
+}
+
+.prose-v11 tbody td {
+  padding: 0.4rem 0.75rem;
+  white-space: nowrap;
+}
+
+.prose-v11 code {
+  font-size: 0.8125rem;
+  background: #f5f5f5;
+  padding: 0.125em 0.375em;
+  border-radius: 0.25rem;
+}
+
+.prose-v11 pre {
+  background: #171717;
+  color: #e5e5e5;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  margin: 0.75em 0;
+}
+
+.prose-v11 pre code {
+  background: none;
+  padding: 0;
+}
