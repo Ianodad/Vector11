@@ -2,7 +2,7 @@
 
 Vector11 is a monochrome football intelligence chat app that answers matchday
 questions with a RAG pipeline over football news and stats sources.
-<img width="1387" height="893" alt="071b9a19-a987-496c-a1c0-a663d92e7e7e" src="https://github.com/user-attachments/assets/74a3a086-61ec-496e-96f0-de6071be0b43" />
+<img width="1507" height="974" alt="203ad781-2ad8-4b6e-b26a-9523db13b71b" src="https://github.com/user-attachments/assets/f2933a47-d4cd-40bc-a0d1-ad2069fa2cf9" />
 
 ## Features
 - RAG chat UI with tactical, data-aware responses
@@ -38,6 +38,14 @@ ALLOW_COLLECTION_RECREATE=false
 FETCH_TIMEOUT_MS=15000
 RETRY_ATTEMPTS=3
 RETRY_BASE_DELAY_MS=1000
+CHILD_CHUNK_SIZE=400
+CHILD_CHUNK_OVERLAP=50
+STATS_CHILD_CHUNK_SIZE=400
+STATS_CHILD_CHUNK_OVERLAP=50
+
+# Vercel Cron - secure the /api/cron/update-db endpoint
+# Generate with: openssl rand -hex 32
+CRON_SECRET=
 ```
 
 3) (Optional) Seed the vector database
