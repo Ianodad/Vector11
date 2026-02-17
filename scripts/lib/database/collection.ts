@@ -11,7 +11,22 @@ export const createCollection = async (
   similarityMetric: SimilarityMetric,
   vectorDimensions: number,
   allowRecreate: string | undefined,
+  forceRecreate = false,
 ): Promise<number> => {
+  // If force recreate is enabled, drop existing collection first
+  if (forceRecreate && isEnabled(allowRecreate)) {
+    try {
+      console.log(`Force recreate enabled - dropping existing collection '${collectionName}'...`);
+      await db.dropCollection(collectionName);
+      console.log(`Collection '${collectionName}' dropped successfully`);
+    } catch (dropErr) {
+      // Collection might not exist, which is fine
+      if (dropErr instanceof Error && !dropErr.message.includes("does not exist")) {
+        console.warn(`Warning dropping collection: ${dropErr.message}`);
+      }
+    }
+  }
+
   try {
     const res = await db.createCollection(collectionName, {
       vector: {

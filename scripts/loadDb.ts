@@ -2,7 +2,7 @@
 import "dotenv/config";
 
 // Config
-import { loadEnvConfig, resolveMaxUrls } from "./lib/config/env.js";
+import { loadEnvConfig, resolveMaxUrls, isEnabled } from "./lib/config/env.js";
 import { initializeClients } from "./lib/config/clients.js";
 import { buildFootballDataList } from "./lib/config/dataSources.js";
 import { initializeSplitters } from "./lib/embeddings/splitters.js";
@@ -250,12 +250,14 @@ const seed = async () => {
   console.log(`- Max URLs: ${config.MAX_SCRAPE_URLS || "Unlimited"}\n`);
 
   // Create collection
+  const forceRecreate = isEnabled(config.FORCE_COLLECTION_RECREATE);
   const vectorDimensions = await createCollection(
     clients.db,
     config.ASTRA_DB_COLLECTION,
     "dot_product",
     config.DEFAULT_VECTOR_DIMENSIONS,
     config.ALLOW_COLLECTION_RECREATE,
+    forceRecreate,
   );
 
   // Process data sources

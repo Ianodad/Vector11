@@ -8,6 +8,7 @@ export interface EnvConfig {
   OPEN_API_KEY: string;
   DEFAULT_VECTOR_DIMENSIONS: number;
   ALLOW_COLLECTION_RECREATE: string | undefined;
+  FORCE_COLLECTION_RECREATE: string | undefined;
   MAX_SCRAPE_URLS: string | undefined;
   EPL_TEAM_PAGES: string | undefined;
   EPL_TEAM_SLUGS: string | undefined;
@@ -52,8 +53,9 @@ export const loadEnvConfig = (): EnvConfig => {
     ),
     OPEN_API_KEY: requiredEnv(process.env.OPEN_API_KEY, "OPEN_API_KEY"),
     DEFAULT_VECTOR_DIMENSIONS:
-      Number(process.env.EMBEDDING_DIMENSIONS) || 1000,
+      Number(process.env.EMBEDDING_DIMENSIONS) || 1536,
     ALLOW_COLLECTION_RECREATE: process.env.ALLOW_COLLECTION_RECREATE,
+    FORCE_COLLECTION_RECREATE: process.env.FORCE_COLLECTION_RECREATE,
     MAX_SCRAPE_URLS: process.env.MAX_SCRAPE_URLS,
     EPL_TEAM_PAGES: process.env.EPL_TEAM_PAGES,
     EPL_TEAM_SLUGS: process.env.EPL_TEAM_SLUGS,
