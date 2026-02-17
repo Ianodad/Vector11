@@ -39,7 +39,7 @@ jobs:
           ASTRA_DB_API_ENDPOINT: ${{ secrets.ASTRA_DB_API_ENDPOINT }}
           ASTRA_DB_APPLICATION_TOKEN: ${{ secrets.ASTRA_DB_APPLICATION_TOKEN }}
           OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
-          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1000' }}
+          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1536' }}
           ALLOW_COLLECTION_RECREATE: "false"
           EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
           EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
