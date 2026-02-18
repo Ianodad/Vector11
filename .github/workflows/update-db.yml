@@ -39,10 +39,10 @@ jobs:
           ASTRA_DB_API_ENDPOINT: ${{ secrets.ASTRA_DB_API_ENDPOINT }}
           ASTRA_DB_APPLICATION_TOKEN: ${{ secrets.ASTRA_DB_APPLICATION_TOKEN }}
           OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
-          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1536' }}
+          EMBEDDING_DIMENSIONS: "1536"
           ALLOW_COLLECTION_RECREATE: "true"
-          FORCE_COLLECTION_RECREATE: ${{ vars.FORCE_COLLECTION_RECREATE || 'true' }}
-          EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
-          EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
-          MAX_SCRAPE_URLS: ${{ vars.MAX_SCRAPE_URLS || '' }}
+          FORCE_COLLECTION_RECREATE: "true"
+          EPL_TEAMS_ENABLED: "false"
+          EPL_TEAM_PAGES: "1"
+          MAX_SCRAPE_URLS: ""
         run: npx tsx scripts/loadDb.ts

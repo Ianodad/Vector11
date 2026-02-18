@@ -230,6 +230,8 @@ const processDataSources = async (
 
 const seed = async () => {
   const startedAt = Date.now();
+  const showEnv = (value: string | undefined): string =>
+    value === undefined ? "undefined" : value === "" ? "(empty)" : value;
   console.log("\n⚽ MAXIMIZED Football Data Scraper");
   console.log("✅ Removed: WhoScored, Medium, UEFA.com, Goal.com");
   console.log("✅ Expanded: Understat (10 leagues), Wikipedia (18 pages)");
@@ -252,6 +254,12 @@ const seed = async () => {
   );
   console.log(`- Max URLs: ${config.MAX_SCRAPE_URLS || "Unlimited"}\n`);
   console.log("🧩 Env settings in use:");
+  console.log("  Raw process.env values:");
+  console.log(`  - EMBEDDING_DIMENSIONS: ${showEnv(process.env.EMBEDDING_DIMENSIONS)}`);
+  console.log(`  - MAX_SCRAPE_URLS: ${showEnv(process.env.MAX_SCRAPE_URLS)}`);
+  console.log(`  - EPL_TEAM_PAGES: ${showEnv(process.env.EPL_TEAM_PAGES)}`);
+  console.log(`  - EPL_TEAM_SLUGS: ${showEnv(process.env.EPL_TEAM_SLUGS)}`);
+  console.log(`  - EPL_TEAMS_ENABLED: ${showEnv(process.env.EPL_TEAMS_ENABLED)}`);
   console.log(`- EMBEDDING_DIMENSIONS: ${config.DEFAULT_VECTOR_DIMENSIONS}`);
   console.log(`- MAX_SCRAPE_URLS: ${config.MAX_SCRAPE_URLS || "Unlimited"}`);
   console.log(`- EPL_TEAM_PAGES: ${config.EPL_TEAM_PAGES || "default"}`);
