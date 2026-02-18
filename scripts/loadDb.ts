@@ -171,6 +171,9 @@ const processDataSources = async (
     }
 
     const { parentDocs, childTexts, childMeta } = chunkingResult;
+    console.log(
+      `  Chunking ${url} -> parents=${parentDocs.length} children=${childTexts.length} meta=${childMeta.length}`,
+    );
 
     try {
       // Generate embeddings
@@ -248,6 +251,27 @@ const seed = async () => {
     `- BBC Team Pages: ${config.EPL_TEAMS_ENABLED ? "✅ Enabled" : "❌ Disabled"}`,
   );
   console.log(`- Max URLs: ${config.MAX_SCRAPE_URLS || "Unlimited"}\n`);
+  console.log("🧩 Env settings in use:");
+  console.log(`- EMBEDDING_DIMENSIONS: ${config.DEFAULT_VECTOR_DIMENSIONS}`);
+  console.log(`- MAX_SCRAPE_URLS: ${config.MAX_SCRAPE_URLS || "Unlimited"}`);
+  console.log(`- EPL_TEAM_PAGES: ${config.EPL_TEAM_PAGES || "default"}`);
+  console.log(`- EPL_TEAM_SLUGS: ${config.EPL_TEAM_SLUGS || "all/default"}`);
+  console.log(
+    `- EPL_TEAMS_ENABLED: ${config.EPL_TEAMS_ENABLED || "false (default)"}`,
+  );
+  console.log("- Chunk config:");
+  console.log(
+    `  - DEFAULT_CHUNK_SIZE/OVERLAP: ${config.DEFAULT_CHUNK_SIZE}/${config.DEFAULT_CHUNK_OVERLAP}`,
+  );
+  console.log(
+    `  - CHILD_CHUNK_SIZE/OVERLAP: ${config.CHILD_CHUNK_SIZE}/${config.CHILD_CHUNK_OVERLAP}`,
+  );
+  console.log(
+    `  - STATS_CHUNK_SIZE/OVERLAP: ${config.STATS_CHUNK_SIZE}/${config.STATS_CHUNK_OVERLAP}`,
+  );
+  console.log(
+    `  - STATS_CHILD_CHUNK_SIZE/OVERLAP: ${config.STATS_CHILD_CHUNK_SIZE}/${config.STATS_CHILD_CHUNK_OVERLAP}\n`,
+  );
 
   // Create collection
   const forceRecreate = isEnabled(config.FORCE_COLLECTION_RECREATE);
@@ -285,7 +309,12 @@ const seed = async () => {
   });
 };
 
-seed().catch((error: unknown) => {
-  console.error("Seed failed:", error);
-  process.exitCode = 1;
-});
+seed()
+  .then(() => {
+    console.log("✅ loadDb completed. Exiting.");
+    process.exit(0);
+  })
+  .catch((error: unknown) => {
+    console.error("Seed failed:", error);
+    process.exit(1);
+  });
