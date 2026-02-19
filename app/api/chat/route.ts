@@ -26,7 +26,7 @@ const ASTRA_DB_APPLICATION_TOKEN = requiredEnv(
   "ASTRA_DB_APPLICATION_TOKEN",
 );
 const OPEN_API_KEY = requiredEnv(process.env.OPEN_API_KEY, "OPEN_API_KEY");
-const EMBEDDING_DIMENSIONS = Number(process.env.EMBEDDING_DIMENSIONS) || 1000;
+const EMBEDDING_DIMENSIONS = Number(process.env.EMBEDDING_DIMENSIONS) || 1536;
 const RATE_LIMIT_WINDOW_MS =
   Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
 const MAX_REQUESTS_PER_WINDOW =
@@ -134,78 +134,183 @@ export async function POST(request: Request) {
 
     let docContent = "";
 
-    // rewrite query using conversation context for better retrieval
-    let retrievalQuery = lastMessage;
-    if (chatMessages.length > 1) {
-      const recentContext = chatMessages
-        .slice(-4)
-        .map((m) => `${m.role}: ${m.content}`)
-        .join("\n");
-      const rewrite = await openai.chat.completions.create({
+    // Plan retrieval: generate 3 query variants + detect category in one LLM call
+    const conversationContext = chatMessages
+      .slice(-4)
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n");
+
+    interface RetrievalPlan {
+      queries: string[];
+      category: string | null;
+    }
+
+    let plan: RetrievalPlan = { queries: [lastMessage], category: null };
+    try {
+      const planResult = await openai.chat.completions.create({
         model: "gpt-5-mini",
         messages: [
           {
             role: "system",
-            content:
-              `Rewrite the user's latest message as a standalone football stats search query. Include all relevant entities (players, teams, competitions, stats, dates) mentioned in the conversation. If season is not explicitly stated, assume current European season ${currentEuropeanSeason}. Output ONLY the rewritten query, nothing else.`,
+            content: `You are a search query planner for a football stats assistant. Given the conversation, output a JSON object with exactly two keys:
+
+- "queries": array of exactly 3 diverse standalone search queries tailored to the question type:
+
+  For STANDINGS / LEAGUE TABLES (stats questions):
+  1. Natural language: e.g. "Premier League 2025-26 standings top teams points"
+  2. Format-matching: "№ Team M W D L G GA PTS xG xGA xPTS [top expected teams for that league]"
+  3. Entity-focused: list the top teams expected in that competition
+
+  For FIXTURES / UPCOMING MATCHES / FIXTURE DIFFICULTY / RUN-IN:
+  1. Natural language: e.g. "Premier League upcoming fixtures schedule 2025-26 tough run-in"
+  2. Format-matching: "Date Home Away fixture [team names] upcoming matches opponent schedule"
+  3. Entity-focused: list the teams and their likely upcoming opponents
+
+  For PLAYER STATS / SCORERS / ASSISTS / xG:
+  1. Natural language: e.g. "Premier League top scorers goals 2025-26"
+  2. Format-matching: "Player Team Apps Goals Assists xG xA [expected player names]"
+  3. Entity-focused: list the expected player names and their teams
+
+  For ANALYSIS / DIFFICULTY / FORM / PREVIEWS:
+  1. Natural language: e.g. "Premier League fixture difficulty run-in tough games analysis"
+  2. Format-matching: use terms like "tough fixture run home away big six [team names]"
+  3. Entity-focused: list the teams and competitions involved
+
+  Stats data stored format reference (use only when relevant to the question type):
+  - League tables: "№ Team M W D L G GA PTS xG xGA xPTS\n1 [Team] [nums]..."
+  - Player stats: "Player Team Apps Goals Assists xG xA"
+  - Fixtures: "Date Home Away Score" or team name + opponent + date
+
+  Always include the specific competition name from the user's question and season ${currentEuropeanSeason} if unspecified.
+
+- "category": one of "news"|"stats"|"playerPerformance"|"fixtures"|"analysis"|"teams" — or null if unclear.
+  Use "stats" for standings, tables, league positions, xG, xPTS.
+  Use "playerPerformance" for individual player stats, top scorers, assists.
+  Use "fixtures" for match schedules, results, upcoming games.
+  Use "analysis" for fixture difficulty, run-in comparisons, form guides, match previews.
+
+Output ONLY valid JSON, no markdown fences.`,
           },
-          { role: "user", content: recentContext },
+          { role: "user", content: conversationContext },
         ],
+        response_format: { type: "json_object" },
       });
-      retrievalQuery =
-        rewrite.choices[0]?.message?.content?.trim() ?? lastMessage;
-      console.log("[chat] rewritten query", {
-        original: lastMessage.slice(0, 80),
-        rewritten: retrievalQuery.slice(0, 80),
-      });
+      const raw = planResult.choices[0]?.message?.content ?? "{}";
+      const parsed = JSON.parse(raw) as Partial<RetrievalPlan>;
+      const queries = Array.isArray(parsed.queries)
+        ? parsed.queries.filter((q): q is string => typeof q === "string").slice(0, 3)
+        : [];
+      plan = {
+        queries: queries.length > 0 ? queries : [lastMessage],
+        category: typeof parsed.category === "string" ? parsed.category : null,
+      };
+    } catch {
+      // fall back to single query if planning fails
     }
-
-    //embedding
-    const embeddingResponse = await openai.embeddings.create({
-      model: "text-embedding-3-large",
-      input: retrievalQuery,
-      encoding_format: "float",
-      dimensions: EMBEDDING_DIMENSIONS,
-    });
-    const embedding = embeddingResponse.data[0].embedding;
-    console.log("[chat] embedding", {
-      dimensions: embedding.length,
-      configured: EMBEDDING_DIMENSIONS,
+    console.log("[chat] retrieval plan", {
+      queries: plan.queries.map((q) => q.slice(0, 60)),
+      category: plan.category,
     });
 
-    //vector search — parent-child retrieval strategy
+    // Embed all queries in parallel
+    const embeddingResponses = await Promise.all(
+      plan.queries.map((q) =>
+        openai.embeddings.create({
+          model: "text-embedding-3-large",
+          input: q,
+          encoding_format: "float",
+          dimensions: EMBEDDING_DIMENSIONS,
+        }),
+      ),
+    );
+    const embeddings = embeddingResponses.map((r) => r.data[0].embedding);
+    console.log("[chat] embeddings", {
+      count: embeddings.length,
+      dimensions: embeddings[0]?.length,
+    });
+
+    // Vector search — multi-query parent-child retrieval
     try {
       const collection = db.collection(ASTRA_DB_COLLECTION);
-      console.log("[chat] vector search (parent-child)", {
+      console.log("[chat] vector search (multi-query parent-child)", {
         keyspace: ASTRA_DB_NAMESPACE,
         collection: ASTRA_DB_COLLECTION,
+        category: plan.category,
       });
 
-      // Step 1: Search child chunks for precise vector matching
-      const cursor = collection.find(
-        { type: "child" },
-        {
-          sort: { $vector: embedding },
-          limit: 10,
-          includeSimilarity: true,
-          projection: { parentId: 1, content: 1, source: 1, url: 1 },
-        },
-      );
-      const childDocs = await cursor.toArray();
-      console.log("[chat] child search results", {
-        count: childDocs.length,
-        sampleKeys: childDocs[0] ? Object.keys(childDocs[0]) : [],
-      });
+      const VALID_CATEGORIES = new Set([
+        "news", "stats", "playerPerformance", "fixtures", "analysis", "teams",
+      ]);
+      const categoryFilter =
+        plan.category && VALID_CATEGORIES.has(plan.category)
+          ? { type: "child", category: plan.category }
+          : { type: "child" };
 
-      // Step 2: Fetch parent chunks for rich LLM context
-      const parentIds = Array.from(
-        new Set(
-          childDocs
-            .map((d) => d.parentId as string | undefined)
-            .filter((id): id is string => Boolean(id)),
+      // Step 1: Run all searches in parallel
+      const searchResults = await Promise.all(
+        embeddings.map((vec) =>
+          collection
+            .find(categoryFilter, {
+              sort: { $vector: vec },
+              limit: 20,
+              includeSimilarity: true,
+              projection: { parentId: 1, content: 1, source: 1, url: 1 },
+            })
+            .toArray(),
         ),
       );
 
+      // Merge results — keep highest-similarity child per parentId
+      const bestByParent = new Map<string, Record<string, unknown>>();
+      for (const docs of searchResults) {
+        for (const doc of docs) {
+          const pid = doc.parentId as string | undefined;
+          if (!pid) continue;
+          const existing = bestByParent.get(pid);
+          const score = (doc.$similarity as number) ?? 0;
+          const existingScore = (existing?.$similarity as number) ?? 0;
+          if (!existing || score > existingScore) {
+            bestByParent.set(pid, doc);
+          }
+        }
+      }
+
+      // If category filter yielded too few results, fall back to unfiltered
+      if (bestByParent.size < 3 && plan.category) {
+        console.log("[chat] category filter low results, retrying without category");
+        const fallbackResults = await Promise.all(
+          embeddings.map((vec) =>
+            collection
+              .find({ type: "child" }, {
+                sort: { $vector: vec },
+                limit: 20,
+                includeSimilarity: true,
+                projection: { parentId: 1, content: 1, source: 1, url: 1 },
+              })
+              .toArray(),
+          ),
+        );
+        for (const docs of fallbackResults) {
+          for (const doc of docs) {
+            const pid = doc.parentId as string | undefined;
+            if (!pid) continue;
+            const existing = bestByParent.get(pid);
+            const score = (doc.$similarity as number) ?? 0;
+            const existingScore = (existing?.$similarity as number) ?? 0;
+            if (!existing || score > existingScore) {
+              bestByParent.set(pid, doc);
+            }
+          }
+        }
+      }
+
+      const parentIds = Array.from(bestByParent.keys());
+      console.log("[chat] merged child results", {
+        uniqueParents: parentIds.length,
+        totalRawHits: searchResults.reduce((s, r) => s + r.length, 0),
+      });
+
+      // Step 2: Fetch parent chunks for rich LLM context
       let parents: Array<Record<string, unknown>> = [];
       if (parentIds.length > 0) {
         parents = await collection
@@ -215,27 +320,22 @@ export async function POST(request: Request) {
           )
           .toArray();
       }
-      console.log("[chat] parent fetch results", {
-        uniqueParentIds: parentIds.length,
-        parentsFetched: parents.length,
-      });
+      console.log("[chat] parent fetch results", { parentsFetched: parents.length });
 
       // Step 3: Use parent content as LLM context (richer than child content)
       if (parents.length > 0) {
-        const parentContent = parents.map((doc) => doc.content);
-        docContent = JSON.stringify(parentContent);
-      } else if (childDocs.length > 0) {
-        // Fallback: use child content if parents are missing (orphaned children)
+        docContent = JSON.stringify(parents.map((doc) => doc.content));
+      } else if (bestByParent.size > 0) {
         console.log("[chat] fallback: using child content (no parents found)");
-        const childContent = childDocs.map((d) => d.content);
-        docContent = JSON.stringify(childContent);
+        docContent = JSON.stringify(
+          Array.from(bestByParent.values()).map((d) => d.content),
+        );
       }
 
-      if (childDocs.length === 0) {
+      if (bestByParent.size === 0) {
         const total = await collection.countDocuments({}, 2000);
         const fallbackDocs = await collection.find({}, { limit: 1 }).toArray();
         console.log("[chat] collection check", {
-          countUpperBound: 2000,
           count: total,
           sampleKeys: fallbackDocs[0] ? Object.keys(fallbackDocs[0]) : [],
           hasTypeField: Boolean(fallbackDocs[0]?.type),

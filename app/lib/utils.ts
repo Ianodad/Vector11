@@ -1,5 +1,61 @@
 // Utility functions
 
+const countPipeCols = (line: string): number => {
+  const t = line.trim();
+  if (!t.startsWith("|") || !t.endsWith("|")) return 0;
+  return t.slice(1, -1).split("|").length;
+};
+
+const isSeparatorCell = (cell: string): boolean =>
+  /^:?-+:?$/.test(cell.trim());
+
+const fixSeparatorRow = (sep: string, expectedCols: number): string => {
+  const t = sep.trim();
+  const cells = t.slice(1, -1).split("|");
+
+  if (cells.length === expectedCols && cells.every(isSeparatorCell)) return sep;
+
+  // Try to split merged cells (e.g. "---:---:" → "---:" + "---:")
+  const expanded: string[] = [];
+  for (const cell of cells) {
+    if (isSeparatorCell(cell)) {
+      expanded.push(cell);
+    } else {
+      const parts = cell.match(/:?-+:?/g) ?? [];
+      expanded.push(...parts);
+    }
+  }
+
+  if (expanded.length === expectedCols) {
+    return "|" + expanded.join("|") + "|";
+  }
+  // Fallback: plain separator with correct column count
+  return "|" + Array(expectedCols).fill("---").join("|") + "|";
+};
+
+export const sanitizeMarkdown = (content: string): string => {
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const out: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const prev = out[out.length - 1] ?? "";
+    const looksLikeSeparator =
+      line.trim().startsWith("|") &&
+      line.includes("-") &&
+      /^[\s|:\-]+$/.test(line);
+
+    if (looksLikeSeparator && prev.trim().startsWith("|")) {
+      const expectedCols = countPipeCols(prev);
+      out.push(fixSeparatorRow(line, expectedCols));
+    } else {
+      out.push(line);
+    }
+  }
+
+  return out.join("\n");
+};
+
 export const pickRandomPrompts = (prompts: readonly string[], count: number): string[] => {
   const shuffled = [...prompts];
   for (let i = shuffled.length - 1; i > 0; i -= 1) {

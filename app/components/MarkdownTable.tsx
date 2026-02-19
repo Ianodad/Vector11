@@ -1,7 +1,7 @@
 // Markdown table renderer with custom styling for football data
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { extractText, detectTableType, getCellClassName } from "../lib/utils";
+import { extractText, detectTableType, getCellClassName, sanitizeMarkdown } from "../lib/utils";
 
 interface MarkdownTableProps {
   content: string;
@@ -31,7 +31,7 @@ export const MarkdownTable = ({ content }: MarkdownTableProps) => {
           },
         }}
       >
-        {content}
+        {sanitizeMarkdown(content)}
       </ReactMarkdown>
     </div>
   );
