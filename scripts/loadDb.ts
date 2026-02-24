@@ -15,7 +15,13 @@ import { batchInsertParents, batchInsertChildren } from "./lib/database/operatio
 import { generateEmbeddings } from "./lib/embeddings/generator.js";
 
 // Scrapers
-import { scrapPage, extractHtmlLinks, filterBbcTeamLinks } from "./lib/scrapers/htmlScraper.js";
+import {
+  scrapPage,
+  scrapeSoccerwayFormPage,
+  scrapeSoccerwayLineupsPage,
+  extractHtmlLinks,
+  filterBbcTeamLinks,
+} from "./lib/scrapers/htmlScraper.js";
 import { extractRssLinks } from "./lib/scrapers/rssScraper.js";
 import { isLowValueContent } from "./lib/scrapers/contentFilter.js";
 import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
@@ -36,7 +42,10 @@ const processDataSources = async (
 ): Promise<{
   processedUrls: number;
   processedUrlList: string[];
+  urlChunkStats: Record<string, { parents: number; children: number }>;
   recordsAdded: number;
+  parentsAdded: number;
+  childrenAdded: number;
   totalEmbeddingTokens: number;
 }> => {
   const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
@@ -45,13 +54,16 @@ const processDataSources = async (
   const maxUrls = resolveMaxUrls(config.MAX_SCRAPE_URLS);
   let processedUrls = 0;
   let recordsAdded = 0;
+  let parentsAdded = 0;
+  let childrenAdded = 0;
   let totalEmbeddingTokens = 0;
+  const urlChunkStats: Record<string, { parents: number; children: number }> = {};
   const processedUrlList: string[] = [];
   let skippedUrls = 0;
   let failedUrls = 0;
 
   for (let i = 0; i < queue.length; i += 1) {
-    const { url, type, source, delay = 2, category = "unknown" } = queue[i];
+    const { url, type, source, delay = 2, category = "unknown", formMode, formMatches } = queue[i];
     const baseTotal = queue.length;
     const capLabel = maxUrls !== undefined ? ` cap=${maxUrls}` : "";
     console.log(
@@ -116,10 +128,48 @@ const processDataSources = async (
 
     const content = await withRetry(
       `scrapPage:${url}`,
-      () => scrapPage(url, type),
+      () => {
+        if (type === "soccerway_form") {
+          return scrapeSoccerwayFormPage(url, {
+            formMode: formMode ?? "home",
+            formMatches: formMatches ?? 5,
+          });
+        }
+        if (type === "soccerway_lineups") {
+          return scrapeSoccerwayLineupsPage(url);
+        }
+        return scrapPage(url, type);
+      },
       config.RETRY_ATTEMPTS,
       config.RETRY_BASE_DELAY_MS,
     );
+
+    // After scraping a Soccerway results page, optionally queue reportUrl and
+    // lineupsUrl discovered in the plain-text records so they are also embedded.
+    // Enable with: SCRAPE_MATCH_DETAILS=1
+    if (
+      isEnabled(config.SCRAPE_MATCH_DETAILS) &&
+      url.includes("soccerway.com") &&
+      url.includes("/results/") &&
+      content
+    ) {
+      for (const line of content.split("\n")) {
+        const reportMatch = line.match(/^reportUrl:\s*(https:\/\/[^\s]+)/);
+        const lineupsMatch = line.match(/^lineupsUrl:\s*(https:\/\/[^\s]+)/);
+        const discovered = reportMatch?.[1] ?? lineupsMatch?.[1];
+        const discoveredType = reportMatch ? "html" : "soccerway_lineups";
+        if (discovered && !seenUrls.has(discovered)) {
+          seenUrls.add(discovered);
+          queue.push({
+            url: discovered,
+            type: discoveredType,
+            source: `${source} ${reportMatch ? "Report" : "Lineups"}`,
+            delay: 5,
+            category,
+          });
+        }
+      }
+    }
 
     // Debug logging for stats sites
     const isStats = isStatsSite(url);
@@ -191,6 +241,7 @@ const processDataSources = async (
       // Insert parent docs
       const parentResult = await batchInsertParents(collection, parentDocs);
       recordsAdded += parentResult.recordsAdded;
+      parentsAdded += parentResult.recordsAdded;
 
       // Insert child docs
       const scrapedAt = new Date().toISOString();
@@ -205,6 +256,13 @@ const processDataSources = async (
         scrapedAt,
       );
       recordsAdded += childResult.recordsAdded;
+      childrenAdded += childResult.recordsAdded;
+
+      // Track per-URL chunk counts for the summary
+      urlChunkStats[url] = {
+        parents: parentResult.recordsAdded,
+        children: childResult.recordsAdded,
+      };
 
       console.log(
         `  Inserted ${parentDocs.length} parents + ${childTexts.length} children for ${url}`,
@@ -225,7 +283,7 @@ const processDataSources = async (
     await sleep(delay);
   }
 
-  return { processedUrls, processedUrlList, recordsAdded, totalEmbeddingTokens };
+  return { processedUrls, processedUrlList, urlChunkStats, recordsAdded, parentsAdded, childrenAdded, totalEmbeddingTokens };
 };
 
 const seed = async () => {
@@ -293,7 +351,7 @@ const seed = async () => {
   );
 
   // Process data sources
-  const { processedUrls, processedUrlList, recordsAdded, totalEmbeddingTokens } =
+  const { processedUrls, processedUrlList, urlChunkStats, recordsAdded, parentsAdded, childrenAdded, totalEmbeddingTokens } =
     await processDataSources(footballData, config, clients, splitters, vectorDimensions);
 
   const durationMs = Date.now() - startedAt;
@@ -302,7 +360,10 @@ const seed = async () => {
   logSummary({
     processedUrls,
     processedUrlList,
+    urlChunkStats,
     recordsAdded,
+    parentsAdded,
+    childrenAdded,
     totalEmbeddingTokens,
     durationMs,
   });
@@ -311,7 +372,10 @@ const seed = async () => {
   await writeSummaryLog({
     processedUrls,
     processedUrlList,
+    urlChunkStats,
     recordsAdded,
+    parentsAdded,
+    childrenAdded,
     totalEmbeddingTokens,
     durationMs,
   });

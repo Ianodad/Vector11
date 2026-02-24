@@ -46,6 +46,38 @@ const getCurrentEuropeanSeason = (date: Date = new Date()): string => {
   return `${startYear}-${endYearShort}`;
 };
 
+const tokenizeQuery = (text: string): string[] =>
+  text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map((t) => t.trim())
+    .filter((t) => t.length >= 3);
+
+const lexicalOverlapScore = (queryTokens: string[], docText: string): number => {
+  if (queryTokens.length === 0 || !docText) return 0;
+  const normalized = docText.toLowerCase();
+  let hits = 0;
+  for (const token of queryTokens) {
+    if (normalized.includes(token)) hits += 1;
+  }
+  return hits / queryTokens.length;
+};
+
+const isLikelyTickerNoise = (text: string): boolean => {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) return true;
+  const signals = [
+    "all live full-time scheduled today",
+    "europa league - play offs",
+    "conference league - play offs",
+  ];
+  const hits = signals.reduce(
+    (count, signal) => (normalized.includes(signal) ? count + 1 : count),
+    0,
+  );
+  return hits >= 2;
+};
+
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN, {
   timeoutDefaults: {
     requestTimeoutMs: 20000,
@@ -211,6 +243,10 @@ Output ONLY valid JSON, no markdown fences.`,
       queries: plan.queries.map((q) => q.slice(0, 60)),
       category: plan.category,
     });
+    const queryTokens = tokenizeQuery([lastMessage, ...plan.queries].join(" "));
+    const fixtureLikeRequest = /fixture|fixtures|result|results|schedule|upcoming|kick-?off/i.test(
+      [lastMessage, ...plan.queries].join(" "),
+    );
 
     // Embed all queries in parallel
     const embeddingResponses = await Promise.all(
@@ -261,16 +297,26 @@ Output ONLY valid JSON, no markdown fences.`,
       );
 
       // Merge results — keep highest-similarity child per parentId
-      const bestByParent = new Map<string, Record<string, unknown>>();
+      const bestByParent = new Map<
+        string,
+        { doc: Record<string, unknown>; rank: number; similarity: number; lexical: number }
+      >();
       for (const docs of searchResults) {
         for (const doc of docs) {
           const pid = doc.parentId as string | undefined;
           if (!pid) continue;
+          const content = (doc.content as string | undefined) ?? "";
+          if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
+
+          const similarity = (doc.$similarity as number) ?? 0;
+          const lexical = lexicalOverlapScore(
+            queryTokens,
+            `${String(doc.source || "")} ${String(doc.url || "")} ${content}`,
+          );
+          const rank = similarity + lexical * 0.08;
           const existing = bestByParent.get(pid);
-          const score = (doc.$similarity as number) ?? 0;
-          const existingScore = (existing?.$similarity as number) ?? 0;
-          if (!existing || score > existingScore) {
-            bestByParent.set(pid, doc);
+          if (!existing || rank > existing.rank) {
+            bestByParent.set(pid, { doc, rank, similarity, lexical });
           }
         }
       }
@@ -294,11 +340,18 @@ Output ONLY valid JSON, no markdown fences.`,
           for (const doc of docs) {
             const pid = doc.parentId as string | undefined;
             if (!pid) continue;
+            const content = (doc.content as string | undefined) ?? "";
+            if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
+
+            const similarity = (doc.$similarity as number) ?? 0;
+            const lexical = lexicalOverlapScore(
+              queryTokens,
+              `${String(doc.source || "")} ${String(doc.url || "")} ${content}`,
+            );
+            const rank = similarity + lexical * 0.08;
             const existing = bestByParent.get(pid);
-            const score = (doc.$similarity as number) ?? 0;
-            const existingScore = (existing?.$similarity as number) ?? 0;
-            if (!existing || score > existingScore) {
-              bestByParent.set(pid, doc);
+            if (!existing || rank > existing.rank) {
+              bestByParent.set(pid, { doc, rank, similarity, lexical });
             }
           }
         }
@@ -324,11 +377,23 @@ Output ONLY valid JSON, no markdown fences.`,
 
       // Step 3: Use parent content as LLM context (richer than child content)
       if (parents.length > 0) {
-        docContent = JSON.stringify(parents.map((doc) => doc.content));
+        docContent = JSON.stringify(
+          parents.map((doc) => ({
+            source: doc.source,
+            url: doc.url,
+            content: doc.content,
+          })),
+        );
       } else if (bestByParent.size > 0) {
         console.log("[chat] fallback: using child content (no parents found)");
         docContent = JSON.stringify(
-          Array.from(bestByParent.values()).map((d) => d.content),
+          Array.from(bestByParent.values()).map(({ doc, similarity, lexical }) => ({
+            source: doc.source,
+            url: doc.url,
+            similarity,
+            lexical,
+            content: doc.content,
+          })),
         );
       }
 
