@@ -9,7 +9,7 @@ on:
 jobs:
   update-db:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -41,7 +41,7 @@ jobs:
           OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
           EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1536' }}
           ALLOW_COLLECTION_RECREATE: ${{ vars.ALLOW_COLLECTION_RECREATE || 'true' }}
-          FORCE_COLLECTION_RECREATE: ${{ vars.FORCE_COLLECTION_RECREATE || 'true' }}
+          FORCE_COLLECTION_RECREATE: ${{ vars.FORCE_COLLECTION_RECREATE || 'false' }}
           EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
           EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
           MAX_SCRAPE_URLS: ${{ vars.MAX_SCRAPE_URLS || '' }}
