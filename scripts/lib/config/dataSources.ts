@@ -2,7 +2,11 @@
 import { EPL_TEAM_SLUGS_ALL } from "./constants.js";
 import { isEnabled, resolveTeamPageCount, resolveTeamSlugs } from "./env.js";
 
-export type SourceType = "html" | "rss";
+export type SourceType =
+  | "html"
+  | "rss"
+  | "soccerway_form"
+  | "soccerway_lineups";
 
 export interface SourceItem {
   url: string;
@@ -10,6 +14,9 @@ export interface SourceItem {
   source: string;
   delay?: number; // Delay in seconds - CRITICAL for rate limiting
   category?: string;
+  // Soccerway form table metadata
+  formMode?: "home" | "away" | "overall";
+  formMatches?: number;
 }
 
 export type SourceCategory =
@@ -22,7 +29,8 @@ export type SourceCategory =
   | "afcon"
   | "teams"
   | "reference"
-  | "rss";
+  | "rss"
+  | "soccerwayForm";
 
 export const buildEplTeamPages = (
   eplTeamsEnabled: string | undefined,
@@ -90,24 +98,24 @@ export const buildFootballDataGroups = (
         delay: 2,
       },
       // ESPN - Clean HTML structure
-      {
-        url: "https://www.espn.com/soccer/",
-        type: "html",
-        source: "ESPN Soccer",
-        delay: 2,
-      },
+      // {
+      //   url: "https://www.espn.com/soccer/",
+      //   type: "html",
+      //   source: "ESPN Soccer",
+      //   delay: 2,
+      // },
       {
         url: "https://www.espn.com/soccer/league/_/name/eng.1",
         type: "html",
         source: "ESPN EPL",
         delay: 2,
       },
-      {
-        url: "https://www.espn.com/soccer/africa/",
-        type: "html",
-        source: "ESPN Africa",
-        delay: 2,
-      },
+      // {
+      //   url: "https://www.espn.com/soccer/africa/",
+      //   type: "html",
+      //   source: "ESPN Africa",
+      //   delay: 2,
+      // },
       {
         url: "https://www.espn.com/soccer/scoreboard",
         type: "html",
@@ -132,6 +140,49 @@ export const buildFootballDataGroups = (
         type: "html",
         source: "The Guardian UCL",
         delay: 2,
+      },
+      // Soccerway News - tournament-specific news feeds (server-side rendered)
+      {
+        url: "https://www.soccerway.com/england/premier-league/news/",
+        type: "html",
+        source: "Soccerway EPL News",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/national/spain/primera-division/news/",
+        type: "html",
+        source: "Soccerway La Liga News",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/national/italy/serie-a/news/",
+        type: "html",
+        source: "Soccerway Serie A News",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/national/germany/bundesliga/news/",
+        type: "html",
+        source: "Soccerway Bundesliga News",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/national/france/ligue-1/news/",
+        type: "html",
+        source: "Soccerway Ligue 1 News",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/international/europe/uefa-champions-league/news/",
+        type: "html",
+        source: "Soccerway UCL News",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/international/europe/uefa-europa-league/news/",
+        type: "html",
+        source: "Soccerway Europa League News",
+        delay: 5,
       },
     ],
 
@@ -231,80 +282,80 @@ export const buildFootballDataGroups = (
         delay: 2,
       },
       // SoccerStats - Static HTML tables
-      {
-        url: "https://www.soccerstats.com/latest.asp",
-        type: "html",
-        source: "SoccerStats",
-        delay: 3,
-      },
-      {
-        url: "https://www.soccerstats.com/league.asp?league=england",
-        type: "html",
-        source: "SoccerStats EPL",
-        delay: 3,
-      },
-      {
-        url: "https://www.soccerstats.com/homeaway.asp?league=england",
-        type: "html",
-        source: "SoccerStats Home/Away",
-        delay: 3,
-      },
+      // {
+      //   url: "https://www.soccerstats.com/latest.asp",
+      //   type: "html",
+      //   source: "SoccerStats",
+      //   delay: 3,
+      // },
+      // {
+      //   url: "https://www.soccerstats.com/league.asp?league=england",
+      //   type: "html",
+      //   source: "SoccerStats EPL",
+      //   delay: 3,
+      // },
+      // {
+      //   url: "https://www.soccerstats.com/homeaway.asp?league=england",
+      //   type: "html",
+      //   source: "SoccerStats Home/Away",
+      //   delay: 3,
+      // },
       // FootyStats - Accessible
-      {
-        url: "https://footystats.org/england/premier-league",
-        type: "html",
-        source: "FootyStats EPL",
-        delay: 3,
-      },
-      {
-        url: "https://footystats.org/england/premier-league/results",
-        type: "html",
-        source: "FootyStats Results",
-        delay: 3,
-      },
+      // {
+      //   url: "https://footystats.org/england/premier-league",
+      //   type: "html",
+      //   source: "FootyStats EPL",
+      //   delay: 3,
+      // },
+      // {
+      //   url: "https://footystats.org/england/premier-league/results",
+      //   type: "html",
+      //   source: "FootyStats Results",
+      //   delay: 3,
+      // },
       // FBref - CRITICAL 6 SECOND DELAY
-      {
-        url: "https://fbref.com/en/comps/9/Premier-League-Stats",
-        type: "html",
-        source: "FBref EPL",
-        delay: 6, // DO NOT REDUCE - will ban you
-      },
-      {
-        url: "https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures",
-        type: "html",
-        source: "FBref EPL Fixtures",
-        delay: 6,
-      },
-      {
-        url: "https://fbref.com/en/comps/9/stats/Premier-League-Stats",
-        type: "html",
-        source: "FBref EPL Team Stats",
-        delay: 6,
-      },
+      // {
+      //   url: "https://fbref.com/en/comps/9/Premier-League-Stats",
+      //   type: "html",
+      //   source: "FBref EPL",
+      //   delay: 6, // DO NOT REDUCE - will ban you
+      // },
+      // {
+      //   url: "https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures",
+      //   type: "html",
+      //   source: "FBref EPL Fixtures",
+      //   delay: 6,
+      // },
+      // {
+      //   url: "https://fbref.com/en/comps/9/stats/Premier-League-Stats",
+      //   type: "html",
+      //   source: "FBref EPL Team Stats",
+      //   delay: 6,
+      // },
     ],
 
     // ============================================
     // PLAYER PERFORMANCE
     // ============================================
     playerPerformance: [
-      {
-        url: "https://fbref.com/en/comps/9/stats/Premier-League-Player-Stats",
-        type: "html",
-        source: "FBref Player Stats EPL",
-        delay: 6,
-      },
-      {
-        url: "https://fbref.com/en/comps/9/shooting/Premier-League-Stats",
-        type: "html",
-        source: "FBref Shooting Stats",
-        delay: 6,
-      },
-      {
-        url: "https://fbref.com/en/comps/9/passing/Premier-League-Stats",
-        type: "html",
-        source: "FBref Passing Stats",
-        delay: 6,
-      },
+      // {
+      //   url: "https://fbref.com/en/comps/9/stats/Premier-League-Player-Stats",
+      //   type: "html",
+      //   source: "FBref Player Stats EPL",
+      //   delay: 6,
+      // },
+      // {
+      //   url: "https://fbref.com/en/comps/9/shooting/Premier-League-Stats",
+      //   type: "html",
+      //   source: "FBref Shooting Stats",
+      //   delay: 6,
+      // },
+      // {
+      //   url: "https://fbref.com/en/comps/9/passing/Premier-League-Stats",
+      //   type: "html",
+      //   source: "FBref Passing Stats",
+      //   delay: 6,
+      // },
     ],
 
     // ============================================
@@ -330,25 +381,116 @@ export const buildFootballDataGroups = (
         source: "Soccerway AFCON",
         delay: 5,
       },
+      // Soccerway (www) – EPL results & fixtures
+      {
+        url: "https://www.soccerway.com/england/premier-league/results/",
+        type: "html",
+        source: "Soccerway EPL Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/england/premier-league/fixtures/",
+        type: "html",
+        source: "Soccerway EPL Fixtures",
+        delay: 5,
+      },
+      // Soccerway – La Liga
+      {
+        url: "https://www.soccerway.com/spain/laliga/results/",
+        type: "html",
+        source: "Soccerway La Liga Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/spain/laliga/fixtures/",
+        type: "html",
+        source: "Soccerway La Liga Fixtures",
+        delay: 5,
+      },
+      // Soccerway – Serie A
+      {
+        url: "https://www.soccerway.com/italy/serie-a/results/",
+        type: "html",
+        source: "Soccerway Serie A Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/italy/serie-a/fixtures/",
+        type: "html",
+        source: "Soccerway Serie A Fixtures",
+        delay: 5,
+      },
+      // Soccerway – Bundesliga
+      {
+        url: "https://www.soccerway.com/germany/bundesliga/results/",
+        type: "html",
+        source: "Soccerway Bundesliga Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/germany/bundesliga/fixtures/",
+        type: "html",
+        source: "Soccerway Bundesliga Fixtures",
+        delay: 5,
+      },
+      // Soccerway – Ligue 1
+      {
+        url: "https://www.soccerway.com/national/france/ligue-1/results/",
+        type: "html",
+        source: "Soccerway Ligue 1 Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/national/france/ligue-1/fixtures/",
+        type: "html",
+        source: "Soccerway Ligue 1 Fixtures",
+        delay: 5,
+      },
+      // Soccerway – UEFA Champions League
+      {
+        url: "https://www.soccerway.com/europe/champions-league/results/",
+        type: "html",
+        source: "Soccerway UCL Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/europe/champions-league/fixtures/",
+        type: "html",
+        source: "Soccerway UCL Fixtures",
+        delay: 5,
+      },
+      // Soccerway – UEFA Europa League
+      {
+        url: "https://www.soccerway.com/international/europe/uefa-europa-league/results/",
+        type: "html",
+        source: "Soccerway Europa League Results",
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/international/europe/uefa-europa-league/fixtures/",
+        type: "html",
+        source: "Soccerway Europa League Fixtures",
+        delay: 5,
+      },
       // WorldFootball.net - VERY accessible
-      {
-        url: "https://www.worldfootball.net/all_matches/eng-premier-league/",
-        type: "html",
-        source: "WorldFootball EPL Matches",
-        delay: 2,
-      },
-      {
-        url: "https://www.worldfootball.net/schedule/eng-premier-league/",
-        type: "html",
-        source: "WorldFootball EPL Schedule",
-        delay: 2,
-      },
-      {
-        url: "https://www.worldfootball.net/schedule/afr-africa-cup-of-nations/",
-        type: "html",
-        source: "WorldFootball AFCON",
-        delay: 2,
-      },
+      // {
+      //   url: "https://www.worldfootball.net/all_matches/eng-premier-league/",
+      //   type: "html",
+      //   source: "WorldFootball EPL Matches",
+      //   delay: 2,
+      // },
+      // {
+      //   url: "https://www.worldfootball.net/schedule/eng-premier-league/",
+      //   type: "html",
+      //   source: "WorldFootball EPL Schedule",
+      //   delay: 2,
+      // },
+      // {
+      //   url: "https://www.worldfootball.net/schedule/afr-africa-cup-of-nations/",
+      //   type: "html",
+      //   source: "WorldFootball AFCON",
+      //   delay: 2,
+      // },
     ],
 
     // ============================================
@@ -361,18 +503,18 @@ export const buildFootballDataGroups = (
         source: "Total Football Analysis",
         delay: 2,
       },
-      {
-        url: "https://totalfootballanalysis.com/category/premier-league",
-        type: "html",
-        source: "TFA Premier League",
-        delay: 2,
-      },
-      {
-        url: "https://www.football365.com/",
-        type: "html",
-        source: "Football365",
-        delay: 3,
-      },
+      // {
+      //   url: "https://totalfootballanalysis.com/category/premier-league",
+      //   type: "html",
+      //   source: "TFA Premier League",
+      //   delay: 2,
+      // },
+      // {
+      //   url: "https://www.football365.com/",
+      //   type: "html",
+      //   source: "Football365",
+      //   delay: 3,
+      // },
       {
         url: "https://www.football365.com/premier-league",
         type: "html",
@@ -547,6 +689,98 @@ export const buildFootballDataGroups = (
     ],
 
     // ============================================
+    // SOCCERWAY FORM TABLES - hash-routed SPA pages
+    // Last-5 home/away form standings for each major league
+    // ============================================
+    soccerwayForm: [
+      // EPL
+      {
+        url: "https://www.soccerway.com/england/premier-league/standings/#/OEEq9Yvp/form/home/5/",
+        type: "soccerway_form",
+        source: "Soccerway EPL Home Form 5",
+        formMode: "home",
+        formMatches: 5,
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/england/premier-league/standings/#/OEEq9Yvp/form/away/5/",
+        type: "soccerway_form",
+        source: "Soccerway EPL Away Form 5",
+        formMode: "away",
+        formMatches: 5,
+        delay: 5,
+      },
+      // La Liga
+      {
+        url: "https://www.soccerway.com/spain/laliga/standings/#/vcm2MhGk/form/home/5/",
+        type: "soccerway_form",
+        source: "Soccerway La Liga Home Form 5",
+        formMode: "home",
+        formMatches: 5,
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/spain/laliga/standings/#/vcm2MhGk/form/away/5/",
+        type: "soccerway_form",
+        source: "Soccerway La Liga Away Form 5",
+        formMode: "away",
+        formMatches: 5,
+        delay: 5,
+      },
+      // Serie A
+      {
+        url: "https://www.soccerway.com/italy/serie-a/standings/#/6PWwAsA7/form/home/5/",
+        type: "soccerway_form",
+        source: "Soccerway Serie A Home Form 5",
+        formMode: "home",
+        formMatches: 5,
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/italy/serie-a/standings/#/6PWwAsA7/form/away/5/",
+        type: "soccerway_form",
+        source: "Soccerway Serie A Away Form 5",
+        formMode: "away",
+        formMatches: 5,
+        delay: 5,
+      },
+      // Bundesliga
+      {
+        url: "https://www.soccerway.com/germany/bundesliga/standings/#/8UYeqfiD/form/home/5/",
+        type: "soccerway_form",
+        source: "Soccerway Bundesliga Home Form 5",
+        formMode: "home",
+        formMatches: 5,
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/germany/bundesliga/standings/#/8UYeqfiD/form/away/5/",
+        type: "soccerway_form",
+        source: "Soccerway Bundesliga Away Form 5",
+        formMode: "away",
+        formMatches: 5,
+        delay: 5,
+      },
+      // UCL
+      {
+        url: "https://www.soccerway.com/europe/champions-league/standings/#/lMPimXln/form/home/5/",
+        type: "soccerway_form",
+        source: "Soccerway UCL Home Form 5",
+        formMode: "home",
+        formMatches: 5,
+        delay: 5,
+      },
+      {
+        url: "https://www.soccerway.com/europe/champions-league/standings/#/lMPimXln/form/away/5/",
+        type: "soccerway_form",
+        source: "Soccerway UCL Away Form 5",
+        formMode: "away",
+        formMatches: 5,
+        delay: 5,
+      },
+    ] as SourceItem[],
+
+    // ============================================
     // RSS FEEDS - SAFEST OPTION
     // ============================================
     rss: [
@@ -583,7 +817,11 @@ export const buildFootballDataList = (
   eplTeamPages: string | undefined,
   eplTeamSlugs: string | undefined,
 ): SourceItem[] => {
-  const groups = buildFootballDataGroups(eplTeamsEnabled, eplTeamPages, eplTeamSlugs);
+  const groups = buildFootballDataGroups(
+    eplTeamsEnabled,
+    eplTeamPages,
+    eplTeamSlugs,
+  );
   return Object.entries(groups).flatMap(([groupKey, items]) =>
     items.map((item) => ({ ...item, category: item.category ?? groupKey })),
   );
