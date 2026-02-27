@@ -14,6 +14,7 @@ export interface EnvConfig {
   EPL_TEAM_SLUGS: string | undefined;
   EPL_TEAMS_ENABLED: string | undefined;
   SCRAPE_MATCH_DETAILS: string | undefined; // queue reportUrl + lineupsUrl from Soccerway results
+  SOURCE_FILTER: string | undefined; // comma-separated domain/name filter e.g. "bbc,understat"
   STATS_CHUNK_SIZE: number;
   STATS_CHUNK_OVERLAP: number;
   DEFAULT_CHUNK_SIZE: number;
@@ -62,6 +63,7 @@ export const loadEnvConfig = (): EnvConfig => {
     EPL_TEAM_SLUGS: process.env.EPL_TEAM_SLUGS,
     EPL_TEAMS_ENABLED: process.env.EPL_TEAMS_ENABLED,
     SCRAPE_MATCH_DETAILS: process.env.SCRAPE_MATCH_DETAILS,
+    SOURCE_FILTER: process.env.SOURCE_FILTER,
     STATS_CHUNK_SIZE: Number(process.env.STATS_CHUNK_SIZE) || 1500,
     STATS_CHUNK_OVERLAP: Number(process.env.STATS_CHUNK_OVERLAP) || 200,
     DEFAULT_CHUNK_SIZE: Number(process.env.DEFAULT_CHUNK_SIZE) || 800,

@@ -801,6 +801,366 @@ export const scrapeSoccerwayLineupsPage = async (url: string): Promise<string> =
   }
 };
 
+// ── Understat API scraper ─────────────────────────────────────────────────────
+// Fetches JSON directly from understat.com/getLeagueData instead of scraping HTML.
+// Produces three RAG-optimised markdown sections: league table, player stats, fixtures.
+
+const UNDERSTAT_LEAGUE_DISPLAY: Record<string, string> = {
+  EPL:        'Premier League',
+  La_liga:    'La Liga',
+  Serie_A:    'Serie A',
+  Ligue_1:    'Ligue 1',
+  Bundesliga: 'Bundesliga',
+};
+
+const UNDERSTAT_HEADERS: Record<string, string> = {
+  'User-Agent':       'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept':           'application/json, text/javascript, */*; q=0.01',
+  'X-Requested-With': 'XMLHttpRequest',
+};
+
+interface UnderstatMatchHistory {
+  wins?:          string | number;
+  draws?:         string | number;
+  loses?:         string | number;
+  scored?:        string | number;
+  missed?:        string | number;
+  pts?:           string | number;
+  xG?:            string | number;
+  xGA?:           string | number;
+  xpts?:          string | number;
+  ppda?:          { att?: string | number; def?: string | number } | unknown;
+  ppda_allowed?:  { att?: string | number; def?: string | number } | unknown;
+}
+interface UnderstatTeam    { title?: string; history?: UnderstatMatchHistory[]; }
+interface UnderstatPlayer  { player_name?: string; team_title?: string; games?: string | number; time?: string | number; goals?: string | number; assists?: string | number; xG?: string | number; xA?: string | number; }
+interface UnderstatGoals   { h?: number | null; a?: number | null; }
+interface UnderstatFixture { datetime?: string; h?: { title?: string }; a?: { title?: string }; goals?: UnderstatGoals; xG?: UnderstatGoals; isResult?: boolean | number | string; }
+interface UnderstatApiResponse { teams?: Record<string, UnderstatTeam>; players?: UnderstatPlayer[]; dates?: UnderstatFixture[]; }
+
+interface UStatTeamRow { Team: string; MP: number; W: number; D: number; L: number; GF: number; GA: number; GD: number; Pts: number; xG: number; xGA: number; xGD: number; xPts: number; dPts: number; }
+interface UStatFixtureRow { dt: Date; isResult: boolean; home: string; away: string; hg: string | null; ag: string | null; hxg: string | null; axg: string | null; monthKey: string; weekKey: string; isoYear: number; isoWeek: number; dateStr: string; timeStr: string; }
+
+const uSgn = (v: number): string => v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2);
+const uF2  = (v: string | number | undefined): string => { const n = parseFloat(String(v ?? 0)); return isNaN(n) ? '0.00' : n.toFixed(2); };
+const uFmtXg  = (v: string | number | null | undefined): string => { const n = parseFloat(String(v ?? '')); return isNaN(n) ? '–' : n.toFixed(2); };
+const uFmtXgd = (h: string | number | null | undefined, a: string | number | null | undefined): string => {
+  const d = parseFloat(String(h ?? '')) - parseFloat(String(a ?? ''));
+  return isNaN(d) ? '–' : d >= 0 ? `+${d.toFixed(2)}` : d.toFixed(2);
+};
+const uResult = (hg: string | number | null | undefined, ag: string | number | null | undefined): string => {
+  const h = parseInt(String(hg ?? ''), 10), a = parseInt(String(ag ?? ''), 10);
+  return (isNaN(h) || isNaN(a)) ? '–' : h > a ? 'H' : h < a ? 'A' : 'D';
+};
+
+const USTAT_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const USTAT_MONTHS_S = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const USTAT_MONTHS_F = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+const uParseDt = (s: string): Date => new Date(s.replace(' ', 'T') + 'Z');
+const uFmtDate = (dt: Date): string =>
+  `${USTAT_WEEKDAYS[dt.getUTCDay()]} ${String(dt.getUTCDate()).padStart(2,'0')} ${USTAT_MONTHS_S[dt.getUTCMonth()]} ${dt.getUTCFullYear()}`;
+const uFmtTime = (dt: Date): string =>
+  `${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')}`;
+
+function uGetISOWeek(dt: Date): [number, number] {
+  const d = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate()));
+  const day = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return [d.getUTCFullYear(), Math.ceil(((d.getTime() - yearStart.getTime()) / 86_400_000 + 1) / 7)];
+}
+
+function uWeekRangeStr(isoYear: number, isoWeek: number): string {
+  try {
+    const jan4 = new Date(Date.UTC(isoYear, 0, 4));
+    const dow  = jan4.getUTCDay() || 7;
+    const mon  = new Date(jan4);
+    mon.setUTCDate(jan4.getUTCDate() - (dow - 1) + (isoWeek - 1) * 7);
+    const sun  = new Date(mon);
+    sun.setUTCDate(mon.getUTCDate() + 6);
+    const ms = USTAT_MONTHS_S;
+    if (mon.getUTCFullYear() === sun.getUTCFullYear()) {
+      if (mon.getUTCMonth() === sun.getUTCMonth())
+        return `${mon.getUTCDate()}–${sun.getUTCDate()} ${ms[mon.getUTCMonth()]} ${mon.getUTCFullYear()}`;
+      return `${mon.getUTCDate()} ${ms[mon.getUTCMonth()]} – ${sun.getUTCDate()} ${ms[sun.getUTCMonth()]} ${sun.getUTCFullYear()}`;
+    }
+    return `${mon.getUTCDate()} ${ms[mon.getUTCMonth()]} ${mon.getUTCFullYear()} – ${sun.getUTCDate()} ${ms[sun.getUTCMonth()]} ${sun.getUTCFullYear()}`;
+  } catch { return `Week ${isoWeek}`; }
+}
+
+function uAggregateTeam(history: UnderstatMatchHistory[]): Omit<UStatTeamRow, 'Team'> {
+  let m=0,w=0,d=0,l=0,g=0,ga=0,pts=0,xg=0,xga=0,xpts=0,paAtt=0,paDef=0,opaAtt=0,opaDef=0;
+  for (const h of history) {
+    m++;
+    w    += parseInt(String(h.wins   ?? 0), 10);
+    d    += parseInt(String(h.draws  ?? 0), 10);
+    l    += parseInt(String(h.loses  ?? 0), 10);
+    g    += parseInt(String(h.scored ?? 0), 10);
+    ga   += parseInt(String(h.missed ?? 0), 10);
+    pts  += parseInt(String(h.pts    ?? 0), 10);
+    xg   += parseFloat(String(h.xG   ?? 0));
+    xga  += parseFloat(String(h.xGA  ?? 0));
+    xpts += parseFloat(String(h.xpts ?? 0));
+    const p  = h.ppda         as { att?: number; def?: number } | null;
+    const pa = h.ppda_allowed as { att?: number; def?: number } | null;
+    if (p  && typeof p  === 'object') { paAtt  += parseInt(String(p.att  ?? 0), 10); paDef  += parseInt(String(p.def  ?? 0), 10); }
+    if (pa && typeof pa === 'object') { opaAtt += parseInt(String(pa.att ?? 0), 10); opaDef += parseInt(String(pa.def ?? 0), 10); }
+  }
+  const r = (v: number) => Math.round(v * 100) / 100;
+  return { MP:m, W:w, D:d, L:l, GF:g, GA:ga, GD:g-ga, Pts:pts, xG:r(xg), xGA:r(xga), xGD:r(xg-xga), xPts:r(xpts), dPts:r(pts-xpts) };
+}
+
+function uBuildTableMd(teams: Record<string, UnderstatTeam>, league: string, year: number): string {
+  const rows: UStatTeamRow[] = Object.entries(teams).map(([id, t]) => ({
+    ...uAggregateTeam(t.history ?? []), Team: t.title ?? id,
+  }));
+  rows.sort((a,b) => b.Pts-a.Pts || b.GD-a.GD || b.GF-a.GF);
+  const season  = `${year}/${String(year+1).slice(-2)}`;
+  const title   = UNDERSTAT_LEAGUE_DISPLAY[league] ?? league;
+  const url     = `https://understat.com/league/${league}/${year}`;
+  const totalMp = rows.length ? Math.max(...rows.map(r=>r.MP)) : 0;
+
+  const lines = [
+    `# ${title} · ${season} · League Table`,
+    '',
+    `> **Type:** League standings  |  **League:** ${title}  |  **Season:** ${season}  |  **Matchday:** ~${totalMp}  |  **Source:** ${url}`,
+    '',
+    '## Column Key',
+    '| Column | Description |',
+    '|:-------|:------------|',
+    '| MP | Matches played |',
+    '| W / D / L | Wins / Draws / Losses |',
+    '| GF / GA | Goals for / against |',
+    '| GD | Goal difference |',
+    '| Pts | League points |',
+    '| xG | Expected goals scored |',
+    '| xGA | Expected goals conceded |',
+    '| xGD | Expected goal difference (xG − xGA) |',
+    '| xPts | Expected points (xG model) |',
+    '| Pts−xPts | Points over/under expectation (luck/efficiency) |',
+    '',
+    '## Standings',
+    '',
+    '| Pos | Team | MP | W | D | L | GF | GA | GD | Pts | xG | xGA | xGD | xPts | Pts−xPts |',
+    '|----:|:-----|--:|--:|--:|--:|---:|---:|---:|----:|---:|----:|----:|-----:|---------:|',
+  ];
+  for (let i=0; i<rows.length; i++) {
+    const r = rows[i];
+    lines.push(`| ${i+1} | ${r.Team} | ${r.MP} | ${r.W} | ${r.D} | ${r.L} | ${r.GF} | ${r.GA} | ${r.GD>=0?'+':''}${r.GD} | ${r.Pts} | ${r.xG} | ${r.xGA} | ${uSgn(r.xGD)} | ${r.xPts} | ${uSgn(r.dPts)} |`);
+  }
+  if (rows.length > 0) {
+    const leader = rows[0], bottom = rows[rows.length-1];
+    const byDelta = [...rows].sort((a,b)=>b.dPts-a.dPts);
+    const over  = byDelta.slice(0,3).map(r=>`${r.Team} (${uSgn(r.dPts)})`);
+    const under = byDelta.slice(-3).reverse().map(r=>`${r.Team} (${uSgn(r.dPts)})`);
+    lines.push('','## Summary','',
+      `- **Leader:** ${leader.Team} — ${leader.Pts} pts from ${leader.MP} matches (xPts: ${leader.xPts}, Pts−xPts: ${uSgn(leader.dPts)})`,
+      `- **Bottom:** ${bottom.Team} — ${bottom.Pts} pts from ${bottom.MP} matches`,
+      `- **Most overperforming xPts:** ${over.join(', ')}`,
+      `- **Most underperforming xPts:** ${under.join(', ')}`,
+    );
+  }
+  lines.push('', `*Data: ${url}*`);
+  return lines.join('\n') + '\n';
+}
+
+function uBuildPlayersMd(players: UnderstatPlayer[], league: string, year: number): string {
+  const MAX = 50;
+  const ps  = players.slice(0, MAX);
+  const season = `${year}/${String(year+1).slice(-2)}`;
+  const title  = UNDERSTAT_LEAGUE_DISPLAY[league] ?? league;
+  const url    = `https://understat.com/league/${league}/${year}`;
+
+  const lines = [
+    `# ${title} · ${season} · Player Statistics (Top ${ps.length})`,
+    '',
+    `> **Type:** Player stats  |  **League:** ${title}  |  **Season:** ${season}  |  **Showing:** top ${ps.length} of ${players.length}  |  **Ranked by:** goals  |  **Source:** ${url}`,
+    '',
+    '## Column Key',
+    '| Column | Description |',
+    '|:-------|:------------|',
+    '| Apps | Appearances |',
+    '| Min | Minutes played |',
+    '| G | Goals |',
+    '| A | Assists |',
+    '| G+A | Combined goal contributions |',
+    '| xG | Expected goals |',
+    '| xA | Expected assists |',
+    '| G−xG | Goals minus xG (finishing efficiency; positive = overperforming) |',
+    '| xG90 | Expected goals per 90 min |',
+    '| xA90 | Expected assists per 90 min |',
+    '',
+    '## Rankings',
+    '',
+    '| # | Player | Team | Apps | Min | G | A | G+A | xG | xA | G−xG | xG90 | xA90 |',
+    '|--:|:-------|:-----|-----:|----:|--:|--:|----:|---:|---:|-----:|-----:|-----:|',
+  ];
+  for (let i=0; i<ps.length; i++) {
+    const p     = ps[i];
+    const apps  = parseInt(String(p.games   ?? 0), 10);
+    const mins  = parseInt(String(parseFloat(String(p.time ?? 0))), 10);
+    const goals = parseInt(String(p.goals   ?? 0), 10);
+    const assts = parseInt(String(p.assists ?? 0), 10);
+    const xg    = Math.round(parseFloat(String(p.xG ?? 0)) * 100) / 100;
+    const xa    = Math.round(parseFloat(String(p.xA ?? 0)) * 100) / 100;
+    const gXg   = Math.round((goals - xg) * 100) / 100;
+    const xg90  = mins > 0 ? Math.round(xg / mins * 90 * 100) / 100 : 0;
+    const xa90  = mins > 0 ? Math.round(xa / mins * 90 * 100) / 100 : 0;
+    lines.push(`| ${i+1} | ${p.player_name??''} | ${p.team_title??''} | ${apps} | ${mins} | ${goals} | ${assts} | ${goals+assts} | ${xg} | ${xa} | ${uSgn(gXg)} | ${xg90} | ${xa90} |`);
+  }
+  const top3g  = ps.slice(0,3);
+  const top3xg = [...ps].sort((a,b)=>parseFloat(String(b.xG??0))-parseFloat(String(a.xG??0))).slice(0,3);
+  const top3xa = [...ps].sort((a,b)=>parseFloat(String(b.xA??0))-parseFloat(String(a.xA??0))).slice(0,3);
+  lines.push('','## Quick Reference','',
+    '**Top scorers:** '  + top3g.map(p=>`${p.player_name} (${p.team_title}, ${p.goals}G)`).join(' | '),
+    '**Highest xG:** '   + top3xg.map(p=>`${p.player_name} (${p.team_title}, ${uF2(p.xG)})`).join(' | '),
+    '**Highest xA:** '   + top3xa.map(p=>`${p.player_name} (${p.team_title}, ${uF2(p.xA)})`).join(' | '),
+    '', `*Data: ${url}*`,
+  );
+  return lines.join('\n') + '\n';
+}
+
+function uBuildFixturesMd(rawFixtures: UnderstatFixture[], league: string, year: number): string {
+  const season = `${year}/${String(year+1).slice(-2)}`;
+  const title  = UNDERSTAT_LEAGUE_DISPLAY[league] ?? league;
+  const url    = `https://understat.com/league/${league}/${year}`;
+
+  const fixtures: UStatFixtureRow[] = [];
+  for (const f of rawFixtures) {
+    if (!f.datetime) continue;
+    const dt = uParseDt(f.datetime);
+    if (isNaN(dt.getTime())) continue;
+    const [isoYear, isoWeek] = uGetISOWeek(dt);
+    const goals = f.goals ?? {};
+    const xg    = f.xG   ?? {};
+    fixtures.push({
+      dt, isResult: Boolean(f.isResult),
+      home: f.h?.title ?? '?', away: f.a?.title ?? '?',
+      hg:  goals.h != null ? String(goals.h) : null,
+      ag:  goals.a != null ? String(goals.a) : null,
+      hxg: xg.h   != null ? String(xg.h)    : null,
+      axg: xg.a   != null ? String(xg.a)    : null,
+      monthKey: `${dt.getUTCFullYear()}-${String(dt.getUTCMonth()+1).padStart(2,'0')}`,
+      weekKey:  `${isoYear}-W${String(isoWeek).padStart(2,'0')}`,
+      isoYear, isoWeek,
+      dateStr: uFmtDate(dt), timeStr: uFmtTime(dt),
+    });
+  }
+  fixtures.sort((a,b) => a.dt.getTime() - b.dt.getTime());
+  const played   = fixtures.filter(f=>f.isResult).length;
+  const unplayed = fixtures.length - played;
+
+  const grouped: Record<string, Record<string, UStatFixtureRow[]>> = {};
+  for (const fx of fixtures) {
+    (grouped[fx.monthKey] ??= {})[fx.weekKey] ??= [];
+    grouped[fx.monthKey][fx.weekKey].push(fx);
+  }
+
+  const lines = [
+    `# ${title} · ${season} · Fixtures & Results`,
+    '',
+    `> **Type:** Fixture list  |  **League:** ${title}  |  **Season:** ${season}  |  **Total:** ${fixtures.length}  |  **Played:** ${played}  |  **Remaining:** ${unplayed}  |  **Source:** ${url}`,
+    '',
+    '## Column Key (played matches)',
+    '| Column | Description |',
+    '|:-------|:------------|',
+    "| Res | H = home win, D = draw, A = away win |",
+    '| HG / AG | Home / Away goals scored |',
+    '| H-xG / A-xG | Expected goals |',
+    '| xGD | xG difference (H-xG − A-xG) |',
+    '',
+    '---',
+  ];
+
+  for (const monthKey of Object.keys(grouped).sort()) {
+    const [mYear, mMonth] = monthKey.split('-').map(Number);
+    lines.push('', `## ${USTAT_MONTHS_F[mMonth-1]} ${mYear}`);
+    for (const weekKey of Object.keys(grouped[monthKey]).sort()) {
+      const wFx     = grouped[monthKey][weekKey];
+      const {isoYear:iy, isoWeek:iw} = wFx[0];
+      const wrange  = uWeekRangeStr(iy, iw);
+      const wPlayed = wFx.filter(fx=>fx.isResult);
+      const wAhead  = wFx.filter(fx=>!fx.isResult);
+      lines.push('', `### ${title} ${season} — Week ${iw} · ${wrange}`, '');
+      if (wPlayed.length) {
+        lines.push(`**Played (${wPlayed.length} matches)**`,'',
+          '| Date | Home | HG | AG | Away | Res | H-xG | A-xG | xGD |',
+          '|:-----|:-----|---:|---:|:-----|:---:|-----:|-----:|----:|',
+        );
+        for (const fx of [...wPlayed].sort((a,b)=>a.dt.getTime()-b.dt.getTime())) {
+          const res = uResult(fx.hg, fx.ag);
+          lines.push(`| ${fx.dateStr} | ${fx.home} | ${fx.hg} | ${fx.ag} | ${fx.away} | **${res}** | ${uFmtXg(fx.hxg)} | ${uFmtXg(fx.axg)} | ${uFmtXgd(fx.hxg,fx.axg)} |`);
+        }
+        const narr = wPlayed.slice(0,6).map(fx => {
+          const res = uResult(fx.hg, fx.ag);
+          const w   = res==='H' ? fx.home : res==='A' ? fx.away : null;
+          return w ? `${fx.home} ${fx.hg}–${fx.ag} ${fx.away} (${w} won)` : `${fx.home} ${fx.hg}–${fx.ag} ${fx.away} (draw)`;
+        });
+        if (narr.length) lines.push('', `> **${title} ${season} results this week:** ${narr.join(' | ')}`);
+      }
+      if (wAhead.length) {
+        lines.push('', `**Upcoming (${wAhead.length} matches)**`,'',
+          '| Date | Home | KO | Away |',
+          '|:-----|:-----|:--:|:-----|',
+        );
+        for (const fx of [...wAhead].sort((a,b)=>a.dt.getTime()-b.dt.getTime())) {
+          lines.push(`| ${fx.dateStr} | ${fx.home} | ${fx.timeStr} | ${fx.away} |`);
+        }
+      }
+    }
+  }
+  lines.push('', '---', '', `*Data from ${url}*`);
+  return lines.join('\n') + '\n';
+}
+
+/**
+ * Scrape an Understat league page by calling the JSON API directly.
+ * URL format: https://understat.com/league/{LEAGUE}/{YEAR}
+ * Returns combined markdown: league table + top-50 players + fixtures/results.
+ */
+export const scrapeUnderstatPage = async (url: string): Promise<string> => {
+  try {
+    const urlMatch = url.match(/understat\.com\/league\/([^/?#]+)(?:\/(\d{4}))?/);
+    if (!urlMatch) return '';
+    const league = urlMatch[1];
+    const now    = new Date();
+    const defYear = now.getMonth() + 1 >= 8 ? now.getFullYear() : now.getFullYear() - 1;
+    const year   = urlMatch[2] ? parseInt(urlMatch[2], 10) : defYear;
+
+    const apiUrl = `https://understat.com/getLeagueData/${league}/${year}`;
+    console.log(`  📊 Understat API → ${apiUrl}`);
+    const resp = await fetch(apiUrl, {
+      headers: { ...UNDERSTAT_HEADERS, Referer: url },
+      signal:  AbortSignal.timeout(30_000),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+    const data = await resp.json() as UnderstatApiResponse;
+
+    const parts: string[] = [];
+
+    const teamsData = data.teams ?? {};
+    if (Object.keys(teamsData).length > 0) {
+      parts.push(uBuildTableMd(teamsData, league, year));
+    }
+    const playersData = data.players ?? [];
+    if (playersData.length > 0) {
+      parts.push(uBuildPlayersMd(playersData, league, year));
+    }
+    const rawFixtures = data.dates ?? [];
+    if (rawFixtures.length > 0) {
+      parts.push(uBuildFixturesMd(rawFixtures, league, year));
+    }
+
+    const combined = parts.join('\n\n---\n\n');
+    console.log(`  📊 Understat: ${Object.keys(teamsData).length} teams, ${playersData.length} players, ${rawFixtures.length} fixtures → ${combined.length} chars`);
+    return combined;
+  } catch (error) {
+    console.error(`Understat API error for ${url}:`, error);
+    return '';
+  }
+};
+
 export const extractHtmlLinks = async (
   url: string,
 ): Promise<Array<{ href: string; text: string }>> => {

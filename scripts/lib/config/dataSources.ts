@@ -6,7 +6,8 @@ export type SourceType =
   | "html"
   | "rss"
   | "soccerway_form"
-  | "soccerway_lineups";
+  | "soccerway_lineups"
+  | "understat";
 
 export interface SourceItem {
   url: string;
@@ -193,93 +194,93 @@ export const buildFootballDataGroups = (
       // Understat - BEST STATS SOURCE (JSON in script tags)
       {
         url: "https://understat.com/league/EPL",
-        type: "html",
+        type: "understat",
         source: "Understat EPL",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/EPL/2024",
-        type: "html",
+        type: "understat",
         source: "Understat EPL 2024",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/EPL/2025",
-        type: "html",
+        type: "understat",
         source: "Understat EPL 2025",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/La_liga",
-        type: "html",
+        type: "understat",
         source: "Understat La Liga",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/La_liga/2024",
-        type: "html",
+        type: "understat",
         source: "Understat La Liga 2024",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/La_liga/2025",
-        type: "html",
+        type: "understat",
         source: "Understat La Liga 2025",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Serie_A",
-        type: "html",
+        type: "understat",
         source: "Understat Serie A",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Serie_A/2024",
-        type: "html",
+        type: "understat",
         source: "Understat Serie A 2024",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Serie_A/2025",
-        type: "html",
+        type: "understat",
         source: "Understat Serie A 2025",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Bundesliga",
-        type: "html",
+        type: "understat",
         source: "Understat Bundesliga",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Bundesliga/2024",
-        type: "html",
+        type: "understat",
         source: "Understat Bundesliga 2024",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Bundesliga/2025",
-        type: "html",
+        type: "understat",
         source: "Understat Bundesliga 2025",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Ligue_1",
-        type: "html",
+        type: "understat",
         source: "Understat Ligue 1",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Ligue_1/2024",
-        type: "html",
+        type: "understat",
         source: "Understat Ligue 1 2024",
-        delay: 2,
+        delay: 3,
       },
       {
         url: "https://understat.com/league/Ligue_1/2025",
-        type: "html",
+        type: "understat",
         source: "Understat Ligue 1 2025",
-        delay: 2,
+        delay: 3,
       },
       // SoccerStats - Static HTML tables
       // {

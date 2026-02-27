@@ -19,6 +19,7 @@ import {
   scrapPage,
   scrapeSoccerwayFormPage,
   scrapeSoccerwayLineupsPage,
+  scrapeUnderstatPage,
   extractHtmlLinks,
   filterBbcTeamLinks,
 } from "./lib/scrapers/htmlScraper.js";
@@ -32,6 +33,24 @@ import { createParentChildChunks } from "./lib/utils/chunking.js";
 import { logSummary, writeSummaryLog } from "./lib/utils/logging.js";
 import { isBbcTeamPage, isBlocked, isLikelyHtml } from "./lib/utils/helpers.js";
 import type { SourceItem } from "./lib/config/dataSources.js";
+
+/**
+ * Filter sources to only those whose URL or source name contains at least one
+ * of the comma-separated terms. Case-insensitive. Falsy filter = no filtering.
+ * Examples:
+ *   filterSourcesByDomain(data, "bbc")            → only BBC sources
+ *   filterSourcesByDomain(data, "bbc,understat")  → BBC + Understat sources
+ *   filterSourcesByDomain(data, "soccerway")      → only Soccerway sources
+ */
+const filterSourcesByDomain = (sources: SourceItem[], filter: string | undefined): SourceItem[] => {
+  if (!filter) return sources;
+  const terms = filter.toLowerCase().split(',').map(t => t.trim()).filter(Boolean);
+  if (terms.length === 0) return sources;
+  return sources.filter(item => {
+    const haystack = `${item.url} ${item.source}`.toLowerCase();
+    return terms.some(term => haystack.includes(term));
+  });
+};
 
 const processDataSources = async (
   footballData: SourceItem[],
@@ -129,6 +148,9 @@ const processDataSources = async (
     const content = await withRetry(
       `scrapPage:${url}`,
       () => {
+        if (type === "understat") {
+          return scrapeUnderstatPage(url);
+        }
         if (type === "soccerway_form") {
           return scrapeSoccerwayFormPage(url, {
             formMode: formMode ?? "home",
@@ -299,14 +321,19 @@ const seed = async () => {
   const config = loadEnvConfig();
   const clients = initializeClients(config);
   const splitters = initializeSplitters(config);
-  const footballData = buildFootballDataList(
+  const allFootballData = buildFootballDataList(
     config.EPL_TEAMS_ENABLED,
     config.EPL_TEAM_PAGES,
     config.EPL_TEAM_SLUGS,
   );
 
+  // Support --source=<filter> CLI arg (overrides SOURCE_FILTER env var)
+  const sourceArgMatch = process.argv.find(a => a.startsWith('--source='));
+  const sourceFilter   = sourceArgMatch ? sourceArgMatch.split('=').slice(1).join('=') : config.SOURCE_FILTER;
+  const footballData   = filterSourcesByDomain(allFootballData, sourceFilter);
+
   console.log("📊 Configuration:");
-  console.log(`- Total sources: ${footballData.length}`);
+  console.log(`- Total sources: ${allFootballData.length}${sourceFilter ? ` (filtered to ${footballData.length} matching "${sourceFilter}")` : ''}`);
   console.log(
     `- BBC Team Pages: ${config.EPL_TEAMS_ENABLED ? "✅ Enabled" : "❌ Disabled"}`,
   );
@@ -325,6 +352,9 @@ const seed = async () => {
   console.log(
     `- EPL_TEAMS_ENABLED: ${config.EPL_TEAMS_ENABLED || "false (default)"}`,
   );
+  if (sourceFilter) {
+    console.log(`- SOURCE_FILTER: "${sourceFilter}" → ${footballData.length}/${allFootballData.length} sources selected`);
+  }
   console.log("- Chunk config:");
   console.log(
     `  - DEFAULT_CHUNK_SIZE/OVERLAP: ${config.DEFAULT_CHUNK_SIZE}/${config.DEFAULT_CHUNK_OVERLAP}`,
