@@ -46,6 +46,67 @@ const getCurrentEuropeanSeason = (date: Date = new Date()): string => {
   return `${startYear}-${endYearShort}`;
 };
 
+const VALID_CATEGORIES = new Set([
+  "news",
+  "stats",
+  "playerPerformance",
+  "fixtures",
+  "analysis",
+  "teams",
+]);
+
+const CATEGORY_FALLBACKS: Record<string, string[]> = {
+  analysis: ["stats"],
+  teams: ["stats", "analysis"],
+  fixtures: ["stats"],
+  playerPerformance: ["stats"],
+  news: ["analysis"],
+  stats: ["analysis"],
+};
+
+const TEAM_ALIASES = [
+  "arsenal",
+  "aston villa",
+  "atlético madrid",
+  "atletico madrid",
+  "barcelona",
+  "bayer leverkusen",
+  "bayern munich",
+  "borussia dortmund",
+  "brighton",
+  "chelsea",
+  "inter milan",
+  "juventus",
+  "liverpool",
+  "manchester city",
+  "man city",
+  "manchester united",
+  "man united",
+  "newcastle",
+  "psg",
+  "paris saint-germain",
+  "real madrid",
+  "roma",
+  "tottenham",
+];
+
+const LEAGUE_HINTS: Array<{ name: string; aliases: string[]; tag: string }> = [
+  { name: "Premier League", aliases: ["premier league", "epl"], tag: "premier-league" },
+  { name: "La Liga", aliases: ["la liga", "laliga", "primera division"], tag: "la-liga" },
+  { name: "Serie A", aliases: ["serie a"], tag: "serie-a" },
+  { name: "Bundesliga", aliases: ["bundesliga"], tag: "bundesliga" },
+  { name: "Ligue 1", aliases: ["ligue 1"], tag: "ligue-1" },
+  { name: "Champions League", aliases: ["champions league", "ucl"], tag: "uefa-champions-league" },
+];
+
+const normalizeSlug = (value: string): string =>
+  value
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+
 const tokenizeQuery = (text: string): string[] =>
   text
     .toLowerCase()
@@ -76,6 +137,82 @@ const isLikelyTickerNoise = (text: string): boolean => {
     0,
   );
   return hits >= 2;
+};
+
+const inferRetrievalCategories = (
+  text: string,
+  plannedCategory: string | null,
+): string[] => {
+  const normalized = text.toLowerCase();
+  const categories: string[] = [];
+
+  const pushCategory = (category: string) => {
+    if (VALID_CATEGORIES.has(category) && !categories.includes(category)) {
+      categories.push(category);
+    }
+  };
+
+  if (plannedCategory && VALID_CATEGORIES.has(plannedCategory)) {
+    pushCategory(plannedCategory);
+    for (const fallback of CATEGORY_FALLBACKS[plannedCategory] ?? []) {
+      pushCategory(fallback);
+    }
+  }
+
+  if (
+    /standing|table|rank|position|points|xg|xga|xpts|compare|comparison|versus|\bvs\b|form/i.test(
+      normalized,
+    )
+  ) {
+    pushCategory("stats");
+  }
+  if (/fixture|fixtures|result|results|schedule|upcoming|kick-?off/i.test(normalized)) {
+    pushCategory("fixtures");
+  }
+  if (/scorer|assists?|player|goals?|xg90|xa90/i.test(normalized)) {
+    pushCategory("playerPerformance");
+  }
+  if (/news|story|stories|latest/i.test(normalized)) {
+    pushCategory("news");
+  }
+  if (/analysis|run-?in|difficulty|form/i.test(normalized)) {
+    pushCategory("analysis");
+  }
+
+  return categories.slice(0, 3);
+};
+
+interface RetrievalHints {
+  leagues: string[];
+  leagueTags: string[];
+  teams: string[];
+  teamTags: string[];
+  seasonVariants: string[];
+}
+
+const buildRetrievalHints = (text: string, currentSeason: string): RetrievalHints => {
+  const normalized = text.toLowerCase();
+  const leagues = LEAGUE_HINTS.filter((league) =>
+    league.aliases.some((alias) => normalized.includes(alias)),
+  );
+  const teams = TEAM_ALIASES.filter((team) => normalized.includes(team));
+  const [startYear, endYearShort] = currentSeason.split("-");
+  const fullEndYear = startYear
+    ? String(Number(startYear) + 1)
+    : "";
+
+  return {
+    leagues: leagues.map((league) => league.name.toLowerCase()),
+    leagueTags: leagues.map((league) => league.tag),
+    teams,
+    teamTags: teams.map((team) => normalizeSlug(team)),
+    seasonVariants: [
+      currentSeason.toLowerCase(),
+      `${startYear}/${endYearShort}`.toLowerCase(),
+      `${startYear}/${fullEndYear}`.toLowerCase(),
+      String(startYear),
+    ].filter(Boolean),
+  };
 };
 
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN, {
@@ -243,10 +380,14 @@ Output ONLY valid JSON, no markdown fences.`,
       queries: plan.queries.map((q) => q.slice(0, 60)),
       category: plan.category,
     });
-    const queryTokens = tokenizeQuery([lastMessage, ...plan.queries].join(" "));
+    const queryBundle = [lastMessage, ...plan.queries].join(" ");
+    const queryTokens = tokenizeQuery(queryBundle);
+    const retrievalHints = buildRetrievalHints(queryBundle, currentEuropeanSeason);
+    const retrievalCategories = inferRetrievalCategories(queryBundle, plan.category);
     const fixtureLikeRequest = /fixture|fixtures|result|results|schedule|upcoming|kick-?off/i.test(
-      [lastMessage, ...plan.queries].join(" "),
+      queryBundle,
     );
+    const comparisonLikeRequest = /compare|comparison|versus|\bvs\b/.test(queryBundle.toLowerCase());
 
     // Embed all queries in parallel
     const embeddingResponses = await Promise.all(
@@ -274,25 +415,36 @@ Output ONLY valid JSON, no markdown fences.`,
         category: plan.category,
       });
 
-      const VALID_CATEGORIES = new Set([
-        "news", "stats", "playerPerformance", "fixtures", "analysis", "teams",
-      ]);
-      const categoryFilter =
-        plan.category && VALID_CATEGORIES.has(plan.category)
-          ? { type: "child", category: plan.category }
-          : { type: "child" };
+      const searchFilters: Array<Record<string, unknown>> = [];
+      if (retrievalCategories.length > 0) {
+        for (const category of retrievalCategories) {
+          searchFilters.push({ type: "child", category });
+        }
+      } else if (plan.category && VALID_CATEGORIES.has(plan.category)) {
+        searchFilters.push({ type: "child", category: plan.category });
+      }
+      searchFilters.push({ type: "child" });
 
       // Step 1: Run all searches in parallel
       const searchResults = await Promise.all(
-        embeddings.map((vec) =>
-          collection
-            .find(categoryFilter, {
-              sort: { $vector: vec },
-              limit: 20,
-              includeSimilarity: true,
-              projection: { parentId: 1, content: 1, source: 1, url: 1 },
-            })
-            .toArray(),
+        searchFilters.flatMap((filter) =>
+          embeddings.map((vec) =>
+            collection
+              .find(filter, {
+                sort: { $vector: vec },
+                limit: 20,
+                includeSimilarity: true,
+                projection: {
+                  parentId: 1,
+                  content: 1,
+                  source: 1,
+                  url: 1,
+                  category: 1,
+                  scrapedAt: 1,
+                },
+              })
+              .toArray(),
+          ),
         ),
       );
 
@@ -309,11 +461,33 @@ Output ONLY valid JSON, no markdown fences.`,
           if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
 
           const similarity = (doc.$similarity as number) ?? 0;
+          const searchText = `${String(doc.source || "")} ${String(doc.url || "")} ${content}`.toLowerCase();
           const lexical = lexicalOverlapScore(
             queryTokens,
-            `${String(doc.source || "")} ${String(doc.url || "")} ${content}`,
+            searchText,
           );
-          const rank = similarity + lexical * 0.08;
+          const leagueBoost = retrievalHints.leagues.some((league) => searchText.includes(league))
+            || retrievalHints.leagueTags.some((tag) => searchText.includes(`#league/${tag}`))
+            ? 0.06
+            : 0;
+          const teamHits = retrievalHints.teams.reduce(
+            (count, team) => (searchText.includes(team) ? count + 1 : count),
+            0,
+          ) + retrievalHints.teamTags.reduce(
+            (count, tag) => (searchText.includes(`#team/${tag}`) ? count + 1 : count),
+            0,
+          );
+          const teamBoost = Math.min(teamHits * 0.03, 0.12);
+          const seasonBoost = retrievalHints.seasonVariants.some((season) => searchText.includes(season))
+            ? 0.04
+            : 0;
+          const statsBoost =
+            comparisonLikeRequest
+            && /standings|league table|xg|xga|xpts|\|\s*pos\s*\|\s*team/i.test(searchText)
+              ? 0.05
+              : 0;
+          const rank =
+            similarity + lexical * 0.08 + leagueBoost + teamBoost + seasonBoost + statsBoost;
           const existing = bestByParent.get(pid);
           if (!existing || rank > existing.rank) {
             bestByParent.set(pid, { doc, rank, similarity, lexical });
@@ -321,43 +495,9 @@ Output ONLY valid JSON, no markdown fences.`,
         }
       }
 
-      // If category filter yielded too few results, fall back to unfiltered
-      if (bestByParent.size < 3 && plan.category) {
-        console.log("[chat] category filter low results, retrying without category");
-        const fallbackResults = await Promise.all(
-          embeddings.map((vec) =>
-            collection
-              .find({ type: "child" }, {
-                sort: { $vector: vec },
-                limit: 20,
-                includeSimilarity: true,
-                projection: { parentId: 1, content: 1, source: 1, url: 1 },
-              })
-              .toArray(),
-          ),
-        );
-        for (const docs of fallbackResults) {
-          for (const doc of docs) {
-            const pid = doc.parentId as string | undefined;
-            if (!pid) continue;
-            const content = (doc.content as string | undefined) ?? "";
-            if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
-
-            const similarity = (doc.$similarity as number) ?? 0;
-            const lexical = lexicalOverlapScore(
-              queryTokens,
-              `${String(doc.source || "")} ${String(doc.url || "")} ${content}`,
-            );
-            const rank = similarity + lexical * 0.08;
-            const existing = bestByParent.get(pid);
-            if (!existing || rank > existing.rank) {
-              bestByParent.set(pid, { doc, rank, similarity, lexical });
-            }
-          }
-        }
-      }
-
-      const parentIds = Array.from(bestByParent.keys());
+      const rankedParents = Array.from(bestByParent.entries())
+        .sort((a, b) => b[1].rank - a[1].rank);
+      const parentIds = rankedParents.slice(0, 12).map(([parentId]) => parentId);
       console.log("[chat] merged child results", {
         uniqueParents: parentIds.length,
         totalRawHits: searchResults.reduce((s, r) => s + r.length, 0),
@@ -377,19 +517,33 @@ Output ONLY valid JSON, no markdown fences.`,
 
       // Step 3: Use parent content as LLM context (richer than child content)
       if (parents.length > 0) {
+        const rankByParentId = new Map(
+          rankedParents.map(([parentId, score]) => [parentId, score]),
+        );
+        const parentOrder = new Map(parentIds.map((id, idx) => [id, idx]));
         docContent = JSON.stringify(
-          parents.map((doc) => ({
-            source: doc.source,
-            url: doc.url,
-            content: doc.content,
-          })),
+          parents
+            .sort((a, b) => {
+              const left = parentOrder.get(String(a._id)) ?? Number.MAX_SAFE_INTEGER;
+              const right = parentOrder.get(String(b._id)) ?? Number.MAX_SAFE_INTEGER;
+              return left - right;
+            })
+            .map((doc) => ({
+              source: doc.source,
+              url: doc.url,
+              rank: rankByParentId.get(String(doc._id))?.rank ?? 0,
+              similarity: rankByParentId.get(String(doc._id))?.similarity ?? 0,
+              lexical: rankByParentId.get(String(doc._id))?.lexical ?? 0,
+              content: doc.content,
+            })),
         );
       } else if (bestByParent.size > 0) {
         console.log("[chat] fallback: using child content (no parents found)");
         docContent = JSON.stringify(
-          Array.from(bestByParent.values()).map(({ doc, similarity, lexical }) => ({
+          rankedParents.slice(0, 12).map(([, { doc, rank, similarity, lexical }]) => ({
             source: doc.source,
             url: doc.url,
+            rank,
             similarity,
             lexical,
             content: doc.content,
