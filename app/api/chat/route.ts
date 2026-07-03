@@ -1,6 +1,7 @@
 // app/api/chat/route.ts
 import OpenAI from "openai";
 import { DataAPIClient } from "@datastax/astra-db-ts";
+import { RETRIEVAL_PLANS } from "../../lib/retrievalPlans";
 
 const requiredEnv = (value: string | undefined, name: string): string => {
   if (!value) {
@@ -190,6 +191,17 @@ interface RetrievalHints {
   seasonVariants: string[];
 }
 
+interface RerankCandidate {
+  parentId: string;
+  source: string;
+  url: string;
+  category: string;
+  similarity: number;
+  lexical: number;
+  rank: number;
+  preview: string;
+}
+
 const buildRetrievalHints = (text: string, currentSeason: string): RetrievalHints => {
   const normalized = text.toLowerCase();
   const leagues = LEAGUE_HINTS.filter((league) =>
@@ -213,6 +225,83 @@ const buildRetrievalHints = (text: string, currentSeason: string): RetrievalHint
       String(startYear),
     ].filter(Boolean),
   };
+};
+
+const rerankEvidenceWithLLM = async (
+  openaiClient: OpenAI,
+  userQuery: string,
+  candidates: RerankCandidate[],
+): Promise<string[] | null> => {
+  if (candidates.length === 0) return null;
+  try {
+    const response = await openaiClient.chat.completions.create({
+      model: "gpt-5-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `You are a retrieval reranker for a football RAG system.
+Given a user query and candidate evidence chunks, return JSON only:
+{"parentIds":["id1","id2",...]}
+
+Rules:
+- Return at most 6 parentIds.
+- Prioritize candidates that directly answer the query entities (league/team/season).
+- Prefer standings/xG/xPts table evidence for comparison/stat questions.
+- Exclude generic or weakly related candidates.
+- Only return IDs that exist in the provided candidates.`,
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            query: userQuery,
+            candidates,
+          }),
+        },
+      ],
+    });
+
+    const raw = response.choices[0]?.message?.content ?? "{}";
+    const parsed = JSON.parse(raw) as { parentIds?: unknown };
+    if (!Array.isArray(parsed.parentIds)) return null;
+
+    const validParentIds = new Set(candidates.map((c) => c.parentId));
+    const selected = parsed.parentIds
+      .filter((id): id is string => typeof id === "string" && validParentIds.has(id))
+      .slice(0, 6);
+
+    return selected.length > 0 ? selected : null;
+  } catch {
+    return null;
+  }
+};
+
+// Serverless Astra hibernates when idle; the first request after a pause fails
+// with a 503 "Resuming your database". Retry only that transient class so a cold
+// DB no longer returns a confident but empty answer to the first user of the day.
+const isDbResumingError = (err: unknown): boolean => {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /resum|503|not (yet )?ready|starting|initializ/i.test(msg);
+};
+
+const withDbResumeRetry = async <T>(
+  op: () => Promise<T>,
+  attempts = 4,
+  baseDelayMs = 1500,
+): Promise<T> => {
+  let lastErr: unknown;
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await op();
+    } catch (err) {
+      lastErr = err;
+      if (i === attempts || !isDbResumingError(err)) throw err;
+      const delayMs = baseDelayMs * i;
+      console.log(`[chat] DB resuming — retry ${i}/${attempts} in ${delayMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastErr;
 };
 
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN, {
@@ -314,14 +403,24 @@ export async function POST(request: Request) {
       category: string | null;
     }
 
+    const precomputed = RETRIEVAL_PLANS.get(lastMessage);
     let plan: RetrievalPlan = { queries: [lastMessage], category: null };
-    try {
-      const planResult = await openai.chat.completions.create({
-        model: "gpt-5-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are a search query planner for a football stats assistant. Given the conversation, output a JSON object with exactly two keys:
+
+    if (precomputed) {
+      // Skip LLM planning call — use pre-computed queries and category
+      plan = { queries: precomputed.queries, category: precomputed.category };
+      console.log("[chat] using precomputed plan", {
+        queries: plan.queries.map((q) => q.slice(0, 60)),
+        category: plan.category,
+      });
+    } else {
+      try {
+        const planResult = await openai.chat.completions.create({
+          model: "gpt-5-mini",
+          messages: [
+            {
+              role: "system",
+              content: `You are a search query planner for a football stats assistant. Given the conversation, output a JSON object with exactly two keys:
 
 - "queries": array of exactly 3 diverse standalone search queries tailored to the question type:
 
@@ -359,27 +458,28 @@ export async function POST(request: Request) {
   Use "analysis" for fixture difficulty, run-in comparisons, form guides, match previews.
 
 Output ONLY valid JSON, no markdown fences.`,
-          },
-          { role: "user", content: conversationContext },
-        ],
-        response_format: { type: "json_object" },
+            },
+            { role: "user", content: conversationContext },
+          ],
+          response_format: { type: "json_object" },
+        });
+        const raw = planResult.choices[0]?.message?.content ?? "{}";
+        const parsed = JSON.parse(raw) as Partial<RetrievalPlan>;
+        const queries = Array.isArray(parsed.queries)
+          ? parsed.queries.filter((q): q is string => typeof q === "string").slice(0, 3)
+          : [];
+        plan = {
+          queries: queries.length > 0 ? queries : [lastMessage],
+          category: typeof parsed.category === "string" ? parsed.category : null,
+        };
+      } catch {
+        // fall back to single query if planning fails
+      }
+      console.log("[chat] retrieval plan", {
+        queries: plan.queries.map((q) => q.slice(0, 60)),
+        category: plan.category,
       });
-      const raw = planResult.choices[0]?.message?.content ?? "{}";
-      const parsed = JSON.parse(raw) as Partial<RetrievalPlan>;
-      const queries = Array.isArray(parsed.queries)
-        ? parsed.queries.filter((q): q is string => typeof q === "string").slice(0, 3)
-        : [];
-      plan = {
-        queries: queries.length > 0 ? queries : [lastMessage],
-        category: typeof parsed.category === "string" ? parsed.category : null,
-      };
-    } catch {
-      // fall back to single query if planning fails
     }
-    console.log("[chat] retrieval plan", {
-      queries: plan.queries.map((q) => q.slice(0, 60)),
-      category: plan.category,
-    });
     const queryBundle = [lastMessage, ...plan.queries].join(" ");
     const queryTokens = tokenizeQuery(queryBundle);
     const retrievalHints = buildRetrievalHints(queryBundle, currentEuropeanSeason);
@@ -425,25 +525,27 @@ Output ONLY valid JSON, no markdown fences.`,
       }
       searchFilters.push({ type: "child" });
 
-      // Step 1: Run all searches in parallel
-      const searchResults = await Promise.all(
-        searchFilters.flatMap((filter) =>
-          embeddings.map((vec) =>
-            collection
-              .find(filter, {
-                sort: { $vector: vec },
-                limit: 20,
-                includeSimilarity: true,
-                projection: {
-                  parentId: 1,
-                  content: 1,
-                  source: 1,
-                  url: 1,
-                  category: 1,
-                  scrapedAt: 1,
-                },
-              })
-              .toArray(),
+      // Step 1: Run all searches in parallel (retry once if the DB is resuming)
+      const searchResults = await withDbResumeRetry(() =>
+        Promise.all(
+          searchFilters.flatMap((filter) =>
+            embeddings.map((vec) =>
+              collection
+                .find(filter, {
+                  sort: { $vector: vec },
+                  limit: 20,
+                  includeSimilarity: true,
+                  projection: {
+                    parentId: 1,
+                    content: 1,
+                    source: 1,
+                    url: 1,
+                    category: 1,
+                    scrapedAt: 1,
+                  },
+                })
+                .toArray(),
+            ),
           ),
         ),
       );
@@ -497,10 +599,38 @@ Output ONLY valid JSON, no markdown fences.`,
 
       const rankedParents = Array.from(bestByParent.entries())
         .sort((a, b) => b[1].rank - a[1].rank);
-      const parentIds = rankedParents.slice(0, 12).map(([parentId]) => parentId);
+      let parentIds = rankedParents.slice(0, 12).map(([parentId]) => parentId);
+      let rerankedParentIds: string[] | null = null;
+      if (precomputed?.skipRerank) {
+        console.log("[chat] skipping rerank (precomputed plan)");
+      } else {
+        const rerankCandidates: RerankCandidate[] = rankedParents
+          .slice(0, 20)
+          .map(([parentId, { doc, similarity, lexical, rank }]) => ({
+            parentId,
+            source: String(doc.source ?? ""),
+            url: String(doc.url ?? ""),
+            category: String(doc.category ?? ""),
+            similarity,
+            lexical,
+            rank,
+            preview: String(doc.content ?? "").replace(/\s+/g, " ").slice(0, 320),
+          }));
+        rerankedParentIds = await rerankEvidenceWithLLM(
+          openai,
+          lastMessage,
+          rerankCandidates,
+        );
+        if (rerankedParentIds && rerankedParentIds.length > 0) {
+          const rerankedSet = new Set(rerankedParentIds);
+          const remaining = parentIds.filter((id) => !rerankedSet.has(id));
+          parentIds = [...rerankedParentIds, ...remaining].slice(0, 12);
+        }
+      }
       console.log("[chat] merged child results", {
         uniqueParents: parentIds.length,
         totalRawHits: searchResults.reduce((s, r) => s + r.length, 0),
+        rerankedTop: rerankedParentIds?.length ?? 0,
       });
 
       // Step 2: Fetch parent chunks for rich LLM context
