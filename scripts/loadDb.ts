@@ -8,7 +8,7 @@ import { buildFootballDataList } from "./lib/config/dataSources.js";
 import { initializeSplitters } from "./lib/embeddings/splitters.js";
 
 // Database
-import { createCollection } from "./lib/database/collection.js";
+import { createCollection, waitForDbReady } from "./lib/database/collection.js";
 import { batchInsertParents, batchInsertChildren } from "./lib/database/operations.js";
 
 // Embeddings
@@ -368,6 +368,12 @@ const seed = async () => {
   console.log(
     `  - STATS_CHILD_CHUNK_SIZE/OVERLAP: ${config.STATS_CHILD_CHUNK_SIZE}/${config.STATS_CHILD_CHUNK_OVERLAP}\n`,
   );
+
+  // Wait for the (possibly hibernating) serverless DB to resume before any
+  // writes — otherwise a cold DB fails the whole seed in ~45s. See waitForDbReady.
+  console.log("⏳ Waiting for Astra DB to be ready...");
+  await waitForDbReady(clients.db);
+  console.log("✅ Astra DB ready\n");
 
   // Create collection
   const forceRecreate = isEnabled(config.FORCE_COLLECTION_RECREATE);
