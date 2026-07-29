@@ -1,7 +1,9 @@
 // app/api/chat/route.ts
 import OpenAI from "openai";
-import { DataAPIClient } from "@datastax/astra-db-ts";
+import { Collection, DataAPIClient, SomeDoc } from "@datastax/astra-db-ts";
 import { RETRIEVAL_PLANS } from "../../lib/retrievalPlans";
+
+export const maxDuration = 60;
 
 const requiredEnv = (value: string | undefined, name: string): string => {
   if (!value) {
@@ -39,31 +41,47 @@ const openai = new OpenAI({
   apiKey: OPEN_API_KEY,
 });
 
-const getCurrentEuropeanSeason = (date: Date = new Date()): string => {
+const getSeasonContext = (date: Date = new Date()) => {
   const month = date.getUTCMonth() + 1;
+  const day = date.getUTCDate();
   const year = date.getUTCFullYear();
-  const startYear = month >= 7 ? year : year - 1;
-  const endYearShort = String((startYear + 1) % 100).padStart(2, "0");
-  return `${startYear}-${endYearShort}`;
+  // Europe's top leagues kick off in the first half of August and finish in May.
+  // A new season only becomes "the latest season" once it has actually kicked off.
+  const newSeasonHasKickedOff = month > 8 || (month === 8 && day >= 8);
+  const startYear = newSeasonHasKickedOff ? year : year - 1;
+  const fmt = (start: number) =>
+    `${start}-${String((start + 1) % 100).padStart(2, "0")}`;
+  const latestSeason = fmt(startYear);
+  const nextSeason = fmt(startYear + 1);
+  // June, July and the first week of August sit between two seasons.
+  const inOffSeason = month === 6 || month === 7 || (month === 8 && day < 8);
+  return { latestSeason, nextSeason, inOffSeason };
 };
 
 const VALID_CATEGORIES = new Set([
   "news",
   "stats",
-  "playerPerformance",
   "fixtures",
   "analysis",
   "teams",
+  "reference",
+  "soccerwayForm",
+  "rss",
 ]);
 
 const CATEGORY_FALLBACKS: Record<string, string[]> = {
-  analysis: ["stats"],
+  analysis: ["stats", "reference"],
   teams: ["stats", "analysis"],
-  fixtures: ["stats"],
-  playerPerformance: ["stats"],
-  news: ["analysis"],
-  stats: ["analysis"],
+  fixtures: ["stats", "soccerwayForm"],
+  news: ["rss", "analysis"],
+  stats: ["reference", "analysis"],
+  reference: ["stats"],
+  soccerwayForm: ["fixtures", "stats"],
+  rss: ["news"],
 };
+
+const normalizeCategory = (c: string | null): string | null =>
+  c === "playerPerformance" ? "stats" : c;
 
 const TEAM_ALIASES = [
   "arsenal",
@@ -171,7 +189,7 @@ const inferRetrievalCategories = (
     pushCategory("fixtures");
   }
   if (/scorer|assists?|player|goals?|xg90|xa90/i.test(normalized)) {
-    pushCategory("playerPerformance");
+    pushCategory("stats");
   }
   if (/news|story|stories|latest/i.test(normalized)) {
     pushCategory("news");
@@ -191,24 +209,13 @@ interface RetrievalHints {
   seasonVariants: string[];
 }
 
-interface RerankCandidate {
-  parentId: string;
-  source: string;
-  url: string;
-  category: string;
-  similarity: number;
-  lexical: number;
-  rank: number;
-  preview: string;
-}
-
-const buildRetrievalHints = (text: string, currentSeason: string): RetrievalHints => {
+const buildRetrievalHints = (text: string, latestSeason: string): RetrievalHints => {
   const normalized = text.toLowerCase();
   const leagues = LEAGUE_HINTS.filter((league) =>
     league.aliases.some((alias) => normalized.includes(alias)),
   );
   const teams = TEAM_ALIASES.filter((team) => normalized.includes(team));
-  const [startYear, endYearShort] = currentSeason.split("-");
+  const [startYear, endYearShort] = latestSeason.split("-");
   const fullEndYear = startYear
     ? String(Number(startYear) + 1)
     : "";
@@ -219,7 +226,7 @@ const buildRetrievalHints = (text: string, currentSeason: string): RetrievalHint
     teams,
     teamTags: teams.map((team) => normalizeSlug(team)),
     seasonVariants: [
-      currentSeason.toLowerCase(),
+      latestSeason.toLowerCase(),
       `${startYear}/${endYearShort}`.toLowerCase(),
       `${startYear}/${fullEndYear}`.toLowerCase(),
       String(startYear),
@@ -227,66 +234,26 @@ const buildRetrievalHints = (text: string, currentSeason: string): RetrievalHint
   };
 };
 
-const rerankEvidenceWithLLM = async (
-  openaiClient: OpenAI,
-  userQuery: string,
-  candidates: RerankCandidate[],
-): Promise<string[] | null> => {
-  if (candidates.length === 0) return null;
-  try {
-    const response = await openaiClient.chat.completions.create({
-      model: "gpt-5-mini",
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content: `You are a retrieval reranker for a football RAG system.
-Given a user query and candidate evidence chunks, return JSON only:
-{"parentIds":["id1","id2",...]}
-
-Rules:
-- Return at most 6 parentIds.
-- Prioritize candidates that directly answer the query entities (league/team/season).
-- Prefer standings/xG/xPts table evidence for comparison/stat questions.
-- Exclude generic or weakly related candidates.
-- Only return IDs that exist in the provided candidates.`,
-        },
-        {
-          role: "user",
-          content: JSON.stringify({
-            query: userQuery,
-            candidates,
-          }),
-        },
-      ],
-    });
-
-    const raw = response.choices[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(raw) as { parentIds?: unknown };
-    if (!Array.isArray(parsed.parentIds)) return null;
-
-    const validParentIds = new Set(candidates.map((c) => c.parentId));
-    const selected = parsed.parentIds
-      .filter((id): id is string => typeof id === "string" && validParentIds.has(id))
-      .slice(0, 6);
-
-    return selected.length > 0 ? selected : null;
-  } catch {
-    return null;
-  }
+// The NVIDIA reranker is a separate service from the database. Its failures must fall back
+// to plain vector search, not be reported to the user as a hibernating database.
+const isRerankerError = (err: unknown): boolean => {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /rerank/i.test(msg);
 };
 
 // Serverless Astra hibernates when idle; the first request after a pause fails
 // with a 503 "Resuming your database". Retry only that transient class so a cold
 // DB no longer returns a confident but empty answer to the first user of the day.
 const isDbResumingError = (err: unknown): boolean => {
+  if (isRerankerError(err)) return false;
   const msg = err instanceof Error ? err.message : String(err);
-  return /resum|503|not (yet )?ready|starting|initializ/i.test(msg);
+  return /resum|hibernat|503|not (yet )?ready|starting|initializ|unavailable_database|not enough (nodes|replicas)|refused to start processing|quorum|safe to retry/i
+    .test(msg);
 };
 
 const withDbResumeRetry = async <T>(
   op: () => Promise<T>,
-  attempts = 4,
+  attempts = 8,
   baseDelayMs = 1500,
 ): Promise<T> => {
   let lastErr: unknown;
@@ -296,7 +263,7 @@ const withDbResumeRetry = async <T>(
     } catch (err) {
       lastErr = err;
       if (i === attempts || !isDbResumingError(err)) throw err;
-      const delayMs = baseDelayMs * i;
+      const delayMs = Math.min(baseDelayMs * i, 8000);
       console.log(`[chat] DB resuming — retry ${i}/${attempts} in ${delayMs}ms`);
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -341,6 +308,44 @@ const getRateLimitStatus = (key: string): { allowed: boolean; retryAfterMs: numb
   return { allowed: true, retryAfterMs: 0 };
 };
 
+interface HybridHit {
+  parentId: string;
+  doc: Record<string, unknown>;
+  rerank: number;
+  similarity: number;
+}
+
+const hybridSearch = async (
+  collection: Collection<SomeDoc>,
+  filter: Record<string, unknown>,
+  vec: number[],
+  lexicalQuery: string,
+  rerankQuery: string,
+): Promise<HybridHit[]> => {
+  const rows = await collection
+    .findAndRerank(filter, {
+      sort: { $hybrid: { $vector: vec, $lexical: lexicalQuery } },
+      limit: 12,
+      hybridLimits: 80,
+      rerankOn: "content",
+      rerankQuery,
+      includeScores: true,
+      projection: {
+        parentId: 1, content: 1, source: 1, url: 1, category: 1, scrapedAt: 1,
+      },
+    })
+    .toArray();
+
+  return rows
+    .map((r) => ({
+      parentId: String(r.document?.parentId ?? ""),
+      doc: r.document ?? {},
+      rerank: Number(r.scores?.$rerank ?? 0),
+      similarity: Number(r.scores?.$vector ?? 0),
+    }))
+    .filter((h) => h.parentId);
+};
+
 export async function POST(request: Request) {
   try {
     const clientIp = getClientIp(request);
@@ -359,7 +364,7 @@ export async function POST(request: Request) {
     }
 
     const todayIso = new Date().toISOString().slice(0, 10);
-    const currentEuropeanSeason = getCurrentEuropeanSeason();
+    const season = getSeasonContext();
     console.log("[chat] request received");
     const { messages } = await request.json();
     const chatMessages = Array.isArray(messages)
@@ -409,6 +414,7 @@ export async function POST(request: Request) {
     if (precomputed) {
       // Skip LLM planning call — use pre-computed queries and category
       plan = { queries: precomputed.queries, category: precomputed.category };
+      plan.category = normalizeCategory(plan.category);
       console.log("[chat] using precomputed plan", {
         queries: plan.queries.map((q) => q.slice(0, 60)),
         category: plan.category,
@@ -449,11 +455,11 @@ export async function POST(request: Request) {
   - Player stats: "Player Team Apps Goals Assists xG xA"
   - Fixtures: "Date Home Away Score" or team name + opponent + date
 
-  Always include the specific competition name from the user's question and season ${currentEuropeanSeason} if unspecified.
+  Always include the specific competition name from the user's question and season ${season.latestSeason} if unspecified.
 
-- "category": one of "news"|"stats"|"playerPerformance"|"fixtures"|"analysis"|"teams" — or null if unclear.
+- "category": one of "news"|"stats"|"fixtures"|"analysis"|"teams"|"reference" — or null if unclear.
   Use "stats" for standings, tables, league positions, xG, xPTS.
-  Use "playerPerformance" for individual player stats, top scorers, assists.
+  Use "stats" for individual player stats, top scorers, assists, xG (player tables live under "stats").
   Use "fixtures" for match schedules, results, upcoming games.
   Use "analysis" for fixture difficulty, run-in comparisons, form guides, match previews.
 
@@ -472,6 +478,7 @@ Output ONLY valid JSON, no markdown fences.`,
           queries: queries.length > 0 ? queries : [lastMessage],
           category: typeof parsed.category === "string" ? parsed.category : null,
         };
+        plan.category = normalizeCategory(plan.category);
       } catch {
         // fall back to single query if planning fails
       }
@@ -482,7 +489,7 @@ Output ONLY valid JSON, no markdown fences.`,
     }
     const queryBundle = [lastMessage, ...plan.queries].join(" ");
     const queryTokens = tokenizeQuery(queryBundle);
-    const retrievalHints = buildRetrievalHints(queryBundle, currentEuropeanSeason);
+    const retrievalHints = buildRetrievalHints(queryBundle, season.latestSeason);
     const retrievalCategories = inferRetrievalCategories(queryBundle, plan.category);
     const fixtureLikeRequest = /fixture|fixtures|result|results|schedule|upcoming|kick-?off/i.test(
       queryBundle,
@@ -515,141 +522,171 @@ Output ONLY valid JSON, no markdown fences.`,
         category: plan.category,
       });
 
-      const searchFilters: Array<Record<string, unknown>> = [];
-      if (retrievalCategories.length > 0) {
-        for (const category of retrievalCategories) {
-          searchFilters.push({ type: "child", category });
-        }
-      } else if (plan.category && VALID_CATEGORIES.has(plan.category)) {
-        searchFilters.push({ type: "child", category: plan.category });
-      }
-      searchFilters.push({ type: "child" });
+      type ScoredDoc = {
+        doc: Record<string, unknown>;
+        similarity: number;
+        rerank?: number;
+        rank?: number;
+        lexical?: number;
+      };
 
-      // Step 1: Run all searches in parallel (retry once if the DB is resuming)
-      const searchResults = await withDbResumeRetry(() =>
-        Promise.all(
-          searchFilters.flatMap((filter) =>
-            embeddings.map((vec) =>
-              collection
-                .find(filter, {
-                  sort: { $vector: vec },
-                  limit: 20,
-                  includeSimilarity: true,
-                  projection: {
-                    parentId: 1,
-                    content: 1,
-                    source: 1,
-                    url: 1,
-                    category: 1,
-                    scrapedAt: 1,
-                  },
-                })
-                .toArray(),
+      let bestByParent: Map<string, ScoredDoc>;
+      let rankedParents: Array<[string, ScoredDoc]>;
+      let parentIds: string[];
+
+      try {
+        // Hybrid search (native $hybrid sort + rerank) — primary path
+        const hybridFilters: Array<Record<string, unknown>> = retrievalCategories
+          .slice(0, 2)
+          .map((category) => ({ type: "child", category }));
+        hybridFilters.push({ type: "child" });
+
+        const hybridResults = await withDbResumeRetry(() =>
+          Promise.all(
+            hybridFilters.flatMap((filter) =>
+              embeddings.map((vec, i) =>
+                hybridSearch(collection, filter, vec, plan.queries[i], lastMessage),
+              ),
             ),
           ),
-        ),
-      );
+        );
 
-      // Merge results — keep highest-similarity child per parentId
-      const bestByParent = new Map<
-        string,
-        { doc: Record<string, unknown>; rank: number; similarity: number; lexical: number }
-      >();
-      for (const docs of searchResults) {
-        for (const doc of docs) {
-          const pid = doc.parentId as string | undefined;
-          if (!pid) continue;
-          const content = (doc.content as string | undefined) ?? "";
-          if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
-
-          const similarity = (doc.$similarity as number) ?? 0;
-          const searchText = `${String(doc.source || "")} ${String(doc.url || "")} ${content}`.toLowerCase();
-          const lexical = lexicalOverlapScore(
-            queryTokens,
-            searchText,
-          );
-          const leagueBoost = retrievalHints.leagues.some((league) => searchText.includes(league))
-            || retrievalHints.leagueTags.some((tag) => searchText.includes(`#league/${tag}`))
-            ? 0.06
-            : 0;
-          const teamHits = retrievalHints.teams.reduce(
-            (count, team) => (searchText.includes(team) ? count + 1 : count),
-            0,
-          ) + retrievalHints.teamTags.reduce(
-            (count, tag) => (searchText.includes(`#team/${tag}`) ? count + 1 : count),
-            0,
-          );
-          const teamBoost = Math.min(teamHits * 0.03, 0.12);
-          const seasonBoost = retrievalHints.seasonVariants.some((season) => searchText.includes(season))
-            ? 0.04
-            : 0;
-          const statsBoost =
-            comparisonLikeRequest
-            && /standings|league table|xg|xga|xpts|\|\s*pos\s*\|\s*team/i.test(searchText)
-              ? 0.05
-              : 0;
-          const rank =
-            similarity + lexical * 0.08 + leagueBoost + teamBoost + seasonBoost + statsBoost;
-          const existing = bestByParent.get(pid);
-          if (!existing || rank > existing.rank) {
-            bestByParent.set(pid, { doc, rank, similarity, lexical });
+        bestByParent = new Map();
+        for (const hits of hybridResults) {
+          for (const hit of hits) {
+            const content = String(hit.doc.content ?? "");
+            if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
+            const existing = bestByParent.get(hit.parentId);
+            if (!existing || hit.rerank > (existing.rerank ?? -Infinity)) {
+              bestByParent.set(hit.parentId, {
+                doc: hit.doc,
+                rerank: hit.rerank,
+                similarity: hit.similarity,
+              });
+            }
           }
         }
-      }
 
-      const rankedParents = Array.from(bestByParent.entries())
-        .sort((a, b) => b[1].rank - a[1].rank);
-      let parentIds = rankedParents.slice(0, 12).map(([parentId]) => parentId);
-      let rerankedParentIds: string[] | null = null;
-      if (precomputed?.skipRerank) {
-        console.log("[chat] skipping rerank (precomputed plan)");
-      } else {
-        const rerankCandidates: RerankCandidate[] = rankedParents
-          .slice(0, 20)
-          .map(([parentId, { doc, similarity, lexical, rank }]) => ({
-            parentId,
-            source: String(doc.source ?? ""),
-            url: String(doc.url ?? ""),
-            category: String(doc.category ?? ""),
-            similarity,
-            lexical,
-            rank,
-            preview: String(doc.content ?? "").replace(/\s+/g, " ").slice(0, 320),
-          }));
-        rerankedParentIds = await rerankEvidenceWithLLM(
-          openai,
-          lastMessage,
-          rerankCandidates,
+        rankedParents = Array.from(bestByParent.entries()).sort(
+          (a, b) => (b[1].rerank ?? -Infinity) - (a[1].rerank ?? -Infinity),
         );
-        if (rerankedParentIds && rerankedParentIds.length > 0) {
-          const rerankedSet = new Set(rerankedParentIds);
-          const remaining = parentIds.filter((id) => !rerankedSet.has(id));
-          parentIds = [...rerankedParentIds, ...remaining].slice(0, 12);
+        parentIds = rankedParents.slice(0, 12).map(([parentId]) => parentId);
+
+        console.log("[chat] hybrid results", {
+          uniqueParents: bestByParent.size,
+          topRerank: rankedParents[0]?.[1].rerank ?? null,
+        });
+      } catch (hybridErr) {
+        if (isDbResumingError(hybridErr)) throw hybridErr;
+        console.log("[chat] hybrid search failed, falling back to vector search", hybridErr);
+
+        const searchFilters: Array<Record<string, unknown>> = [];
+        if (retrievalCategories.length > 0) {
+          for (const category of retrievalCategories) {
+            searchFilters.push({ type: "child", category });
+          }
+        } else if (plan.category && VALID_CATEGORIES.has(plan.category)) {
+          searchFilters.push({ type: "child", category: plan.category });
         }
+        searchFilters.push({ type: "child" });
+
+        // Step 1: Run all searches in parallel (retry once if the DB is resuming)
+        const searchResults = await withDbResumeRetry(() =>
+          Promise.all(
+            searchFilters.flatMap((filter) =>
+              embeddings.map((vec) =>
+                collection
+                  .find(filter, {
+                    sort: { $vector: vec },
+                    limit: 20,
+                    includeSimilarity: true,
+                    projection: {
+                      parentId: 1,
+                      content: 1,
+                      source: 1,
+                      url: 1,
+                      category: 1,
+                      scrapedAt: 1,
+                    },
+                  })
+                  .toArray(),
+              ),
+            ),
+          ),
+        );
+
+        // Merge results — keep highest-similarity child per parentId
+        bestByParent = new Map();
+        for (const docs of searchResults) {
+          for (const doc of docs) {
+            const pid = doc.parentId as string | undefined;
+            if (!pid) continue;
+            const content = (doc.content as string | undefined) ?? "";
+            if (fixtureLikeRequest && isLikelyTickerNoise(content)) continue;
+
+            const similarity = (doc.$similarity as number) ?? 0;
+            const searchText = `${String(doc.source || "")} ${String(doc.url || "")} ${content}`.toLowerCase();
+            const lexical = lexicalOverlapScore(
+              queryTokens,
+              searchText,
+            );
+            const leagueBoost = retrievalHints.leagues.some((league) => searchText.includes(league))
+              || retrievalHints.leagueTags.some((tag) => searchText.includes(`#league/${tag}`))
+              ? 0.06
+              : 0;
+            const teamHits = retrievalHints.teams.reduce(
+              (count, team) => (searchText.includes(team) ? count + 1 : count),
+              0,
+            ) + retrievalHints.teamTags.reduce(
+              (count, tag) => (searchText.includes(`#team/${tag}`) ? count + 1 : count),
+              0,
+            );
+            const teamBoost = Math.min(teamHits * 0.03, 0.12);
+            const seasonBoost = retrievalHints.seasonVariants.some((variant) => searchText.includes(variant))
+              ? 0.04
+              : 0;
+            const statsBoost =
+              comparisonLikeRequest
+              && /standings|league table|xg|xga|xpts|\|\s*pos\s*\|\s*team/i.test(searchText)
+                ? 0.05
+                : 0;
+            const rank =
+              similarity + lexical * 0.08 + leagueBoost + teamBoost + seasonBoost + statsBoost;
+            const existing = bestByParent.get(pid);
+            if (!existing || rank > (existing.rank ?? -Infinity)) {
+              bestByParent.set(pid, { doc, rank, similarity, lexical });
+            }
+          }
+        }
+
+        rankedParents = Array.from(bestByParent.entries()).sort(
+          (a, b) => (b[1].rank ?? -Infinity) - (a[1].rank ?? -Infinity),
+        );
+        parentIds = rankedParents.slice(0, 12).map(([parentId]) => parentId);
+
+        console.log("[chat] merged child results", {
+          uniqueParents: parentIds.length,
+          totalRawHits: searchResults.reduce((s, r) => s + r.length, 0),
+        });
       }
-      console.log("[chat] merged child results", {
-        uniqueParents: parentIds.length,
-        totalRawHits: searchResults.reduce((s, r) => s + r.length, 0),
-        rerankedTop: rerankedParentIds?.length ?? 0,
-      });
 
       // Step 2: Fetch parent chunks for rich LLM context
       let parents: Array<Record<string, unknown>> = [];
       if (parentIds.length > 0) {
-        parents = await collection
-          .find(
-            { _id: { $in: parentIds } },
-            { projection: { content: 1, source: 1, url: 1 } },
-          )
-          .toArray();
+        parents = await withDbResumeRetry(() =>
+          collection
+            .find(
+              { _id: { $in: parentIds } },
+              { projection: { content: 1, source: 1, url: 1 } },
+            )
+            .toArray(),
+        );
       }
       console.log("[chat] parent fetch results", { parentsFetched: parents.length });
 
       // Step 3: Use parent content as LLM context (richer than child content)
       if (parents.length > 0) {
-        const rankByParentId = new Map(
-          rankedParents.map(([parentId, score]) => [parentId, score]),
-        );
+        const rankByParentId = new Map(rankedParents);
         const parentOrder = new Map(parentIds.map((id, idx) => [id, idx]));
         docContent = JSON.stringify(
           parents
@@ -658,40 +695,62 @@ Output ONLY valid JSON, no markdown fences.`,
               const right = parentOrder.get(String(b._id)) ?? Number.MAX_SAFE_INTEGER;
               return left - right;
             })
-            .map((doc) => ({
-              source: doc.source,
-              url: doc.url,
-              rank: rankByParentId.get(String(doc._id))?.rank ?? 0,
-              similarity: rankByParentId.get(String(doc._id))?.similarity ?? 0,
-              lexical: rankByParentId.get(String(doc._id))?.lexical ?? 0,
-              content: doc.content,
-            })),
+            .map((doc) => {
+              const score = rankByParentId.get(String(doc._id));
+              return {
+                source: doc.source,
+                url: doc.url,
+                ...(score?.rerank !== undefined
+                  ? { rerank: score.rerank }
+                  : { rank: score?.rank ?? 0, lexical: score?.lexical ?? 0 }),
+                similarity: score?.similarity ?? 0,
+                content: doc.content,
+              };
+            }),
         );
       } else if (bestByParent.size > 0) {
         console.log("[chat] fallback: using child content (no parents found)");
         docContent = JSON.stringify(
-          rankedParents.slice(0, 12).map(([, { doc, rank, similarity, lexical }]) => ({
-            source: doc.source,
-            url: doc.url,
-            rank,
-            similarity,
-            lexical,
-            content: doc.content,
+          rankedParents.slice(0, 12).map(([, score]) => ({
+            source: score.doc.source,
+            url: score.doc.url,
+            ...(score.rerank !== undefined
+              ? { rerank: score.rerank }
+              : { rank: score.rank ?? 0, lexical: score.lexical ?? 0 }),
+            similarity: score.similarity,
+            content: score.doc.content,
           })),
         );
       }
 
       if (bestByParent.size === 0) {
-        const total = await collection.countDocuments({}, 2000);
-        const fallbackDocs = await collection.find({}, { limit: 1 }).toArray();
-        console.log("[chat] collection check", {
-          count: total,
-          sampleKeys: fallbackDocs[0] ? Object.keys(fallbackDocs[0]) : [],
-          hasTypeField: Boolean(fallbackDocs[0]?.type),
-        });
+        try {
+          const total = await withDbResumeRetry(() =>
+            collection.countDocuments({}, 2000),
+          );
+          const fallbackDocs = await withDbResumeRetry(() =>
+            collection.find({}, { limit: 1 }).toArray(),
+          );
+          console.log("[chat] collection check", {
+            count: total,
+            sampleKeys: fallbackDocs[0] ? Object.keys(fallbackDocs[0]) : [],
+            hasTypeField: Boolean(fallbackDocs[0]?.type),
+          });
+        } catch (diagnosticErr) {
+          console.log("[chat] collection check failed (diagnostic only)", diagnosticErr);
+        }
       }
     } catch (error) {
       console.log("Error querying vector search:", error);
+      if (isDbResumingError(error)) {
+        return Response.json(
+          {
+            error:
+              "The stats database is waking up from sleep. Give it about 30 seconds and ask again.",
+          },
+          { status: 503, headers: { "Retry-After": "30" } },
+        );
+      }
       docContent = "";
     }
 
@@ -702,15 +761,24 @@ Output ONLY valid JSON, no markdown fences.`,
 
 Date context:
 - Today (UTC): ${todayIso}
-- Current European season baseline: ${currentEuropeanSeason}
+- Latest season with data: ${season.latestSeason}${season.inOffSeason ? " — this season is COMPLETE (it has finished)" : " — currently in progress"}${season.inOffSeason ? `
+- The ${season.nextSeason} season has NOT kicked off yet.` : ""}
+
+Season rules (IMPORTANT):
+- "current", "latest", "now" and "this season" all mean ${season.latestSeason}.
+- Report ${season.latestSeason} figures and label them clearly (e.g. "${season.latestSeason} final table").${season.inOffSeason ? `
+- ${season.latestSeason} is FINISHED, not upcoming. Never describe it as "not started" or "not yet kicked off".
+- You have NO ${season.nextSeason} data. Mention ${season.nextSeason} only to note it has not begun, and only if it is relevant.` : ""}
+- Prefer the newest season present in the retrieved context. Do not fall back to an older
+  season when a newer one is available in the context.
+- NEVER refuse to answer solely because an even newer season has no data yet.
+- Only say data is unavailable if the retrieved context contains NOTHING relevant to the question.
 
 Rules:
 - Always use retrieved context from the vector database as the primary source of truth.
 - If the context is partial, combine it with general football knowledge and clearly label what is from context vs general knowledge.
 - If no relevant context is available, state that clearly, then answer from general knowledge.
-- Default to CURRENT season/year when user asks "current", "latest", "now", or does not specify a season.
 - If user provides a historical table (for example last season), treat it as historical and do not present it as current.
-- When current-season data is unavailable, say it is unavailable instead of guessing.
 
 Table output format:
 - If the user asks for standings, top teams, rankings, or league tables, output one markdown table first.
@@ -767,7 +835,8 @@ ${docContent}`,
 
     const assistantMessage = response.choices[0]?.message?.content ?? "";
     return Response.json({ message: assistantMessage });
-  } catch {
+  } catch (error) {
+    console.log("[chat] request failed:", error);
     return Response.json(
       { error: "Failed to generate response." },
       { status: 500 },

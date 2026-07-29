@@ -5,7 +5,6 @@ import "dotenv/config";
 import { loadEnvConfig, resolveMaxUrls, isEnabled } from "./lib/config/env.js";
 import { initializeClients } from "./lib/config/clients.js";
 import { buildFootballDataList } from "./lib/config/dataSources.js";
-import { initializeSplitters } from "./lib/embeddings/splitters.js";
 
 // Database
 import { createCollection, waitForDbReady } from "./lib/database/collection.js";
@@ -56,7 +55,6 @@ const processDataSources = async (
   footballData: SourceItem[],
   config: ReturnType<typeof loadEnvConfig>,
   clients: ReturnType<typeof initializeClients>,
-  splitters: ReturnType<typeof initializeSplitters>,
   vectorDimensions: number,
 ): Promise<{
   processedUrls: number;
@@ -65,6 +63,7 @@ const processDataSources = async (
   recordsAdded: number;
   parentsAdded: number;
   childrenAdded: number;
+  recordsSkipped: number;
   totalEmbeddingTokens: number;
 }> => {
   const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
@@ -75,6 +74,7 @@ const processDataSources = async (
   let recordsAdded = 0;
   let parentsAdded = 0;
   let childrenAdded = 0;
+  let recordsSkipped = 0;
   let totalEmbeddingTokens = 0;
   const urlChunkStats: Record<string, { parents: number; children: number }> = {};
   const processedUrlList: string[] = [];
@@ -222,13 +222,23 @@ const processDataSources = async (
     }
 
     // Parent-child chunking
-    const parentSplitter = isStats ? splitters.statsSplitter : splitters.defaultSplitter;
-    const childSplitter = isStats ? splitters.statsChildSplitter : splitters.defaultChildSplitter;
+    const chunkSizes = isStats
+      ? {
+          parentMaxSize: config.STATS_CHUNK_SIZE,
+          parentOverlap: config.STATS_CHUNK_OVERLAP,
+          childMaxSize: config.STATS_CHILD_CHUNK_SIZE,
+          childOverlap: config.STATS_CHILD_CHUNK_OVERLAP,
+        }
+      : {
+          parentMaxSize: config.DEFAULT_CHUNK_SIZE,
+          parentOverlap: config.DEFAULT_CHUNK_OVERLAP,
+          childMaxSize: config.CHILD_CHUNK_SIZE,
+          childOverlap: config.CHILD_CHUNK_OVERLAP,
+        };
 
     const chunkingResult = await createParentChildChunks(
       content,
-      parentSplitter,
-      childSplitter,
+      chunkSizes,
       source,
       url,
       category,
@@ -264,6 +274,7 @@ const processDataSources = async (
       const parentResult = await batchInsertParents(collection, parentDocs);
       recordsAdded += parentResult.recordsAdded;
       parentsAdded += parentResult.recordsAdded;
+      recordsSkipped += parentResult.recordsSkipped;
 
       // Insert child docs
       const scrapedAt = new Date().toISOString();
@@ -279,6 +290,7 @@ const processDataSources = async (
       );
       recordsAdded += childResult.recordsAdded;
       childrenAdded += childResult.recordsAdded;
+      recordsSkipped += childResult.recordsSkipped;
 
       // Track per-URL chunk counts for the summary
       urlChunkStats[url] = {
@@ -305,7 +317,16 @@ const processDataSources = async (
     await sleep(delay);
   }
 
-  return { processedUrls, processedUrlList, urlChunkStats, recordsAdded, parentsAdded, childrenAdded, totalEmbeddingTokens };
+  return {
+    processedUrls,
+    processedUrlList,
+    urlChunkStats,
+    recordsAdded,
+    parentsAdded,
+    childrenAdded,
+    recordsSkipped,
+    totalEmbeddingTokens,
+  };
 };
 
 const seed = async () => {
@@ -320,7 +341,6 @@ const seed = async () => {
   // Load configuration
   const config = loadEnvConfig();
   const clients = initializeClients(config);
-  const splitters = initializeSplitters(config);
   const allFootballData = buildFootballDataList(
     config.EPL_TEAMS_ENABLED,
     config.EPL_TEAM_PAGES,
@@ -387,10 +407,23 @@ const seed = async () => {
   );
 
   // Process data sources
-  const { processedUrls, processedUrlList, urlChunkStats, recordsAdded, parentsAdded, childrenAdded, totalEmbeddingTokens } =
-    await processDataSources(footballData, config, clients, splitters, vectorDimensions);
+  const {
+    processedUrls,
+    processedUrlList,
+    urlChunkStats,
+    recordsAdded,
+    parentsAdded,
+    childrenAdded,
+    recordsSkipped,
+    totalEmbeddingTokens,
+  } = await processDataSources(footballData, config, clients, vectorDimensions);
 
   const durationMs = Date.now() - startedAt;
+
+  // A silent partial seed must be impossible: any document Astra rejected for
+  // exceeding its 8,000-byte indexed field limit was logged per-document above
+  // and is summed here as one unmissable end-of-run total.
+  console.log(`\nSkipped ${recordsSkipped} oversized documents`);
 
   // Log summary
   logSummary({

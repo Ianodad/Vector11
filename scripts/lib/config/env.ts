@@ -35,7 +35,72 @@ export const requiredEnv = (value: string | undefined, name: string): string => 
   return value;
 };
 
+// A chunk size <= 0 makes the chunker's hard-cut loop (`i += maxSize`) spin
+// forever, and a non-positive/out-of-range overlap makes no sense either —
+// both are rejected here rather than trusted through from the environment.
+const parseChunkSize = (raw: string | undefined, name: string, fallback: number): number => {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1) {
+    console.warn(
+      `[env] ${name}=${raw} is not a valid chunk size (must be >= 1); using default ${fallback}`,
+    );
+    return fallback;
+  }
+  return Math.floor(value);
+};
+
+const parseChunkOverlap = (
+  raw: string | undefined,
+  name: string,
+  size: number,
+  fallback: number,
+): number => {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0 || value >= size) {
+    console.warn(
+      `[env] ${name}=${raw} is not a valid overlap (must be >= 0 and < size ${size}); using default ${fallback}`,
+    );
+    return fallback;
+  }
+  return Math.floor(value);
+};
+
 export const loadEnvConfig = (): EnvConfig => {
+  const statsChunkSize = parseChunkSize(process.env.STATS_CHUNK_SIZE, "STATS_CHUNK_SIZE", 1500);
+  const statsChunkOverlap = parseChunkOverlap(
+    process.env.STATS_CHUNK_OVERLAP,
+    "STATS_CHUNK_OVERLAP",
+    statsChunkSize,
+    200,
+  );
+  const defaultChunkSize = parseChunkSize(process.env.DEFAULT_CHUNK_SIZE, "DEFAULT_CHUNK_SIZE", 800);
+  const defaultChunkOverlap = parseChunkOverlap(
+    process.env.DEFAULT_CHUNK_OVERLAP,
+    "DEFAULT_CHUNK_OVERLAP",
+    defaultChunkSize,
+    150,
+  );
+  const childChunkSize = parseChunkSize(process.env.CHILD_CHUNK_SIZE, "CHILD_CHUNK_SIZE", 400);
+  const childChunkOverlap = parseChunkOverlap(
+    process.env.CHILD_CHUNK_OVERLAP,
+    "CHILD_CHUNK_OVERLAP",
+    childChunkSize,
+    50,
+  );
+  const statsChildChunkSize = parseChunkSize(
+    process.env.STATS_CHILD_CHUNK_SIZE,
+    "STATS_CHILD_CHUNK_SIZE",
+    400,
+  );
+  const statsChildChunkOverlap = parseChunkOverlap(
+    process.env.STATS_CHILD_CHUNK_OVERLAP,
+    "STATS_CHILD_CHUNK_OVERLAP",
+    statsChildChunkSize,
+    50,
+  );
+
   return {
     ASTRA_DB_NAMESPACE: requiredEnv(
       process.env.ASTRA_DB_NAMESPACE,
@@ -64,15 +129,14 @@ export const loadEnvConfig = (): EnvConfig => {
     EPL_TEAMS_ENABLED: process.env.EPL_TEAMS_ENABLED,
     SCRAPE_MATCH_DETAILS: process.env.SCRAPE_MATCH_DETAILS,
     SOURCE_FILTER: process.env.SOURCE_FILTER,
-    STATS_CHUNK_SIZE: Number(process.env.STATS_CHUNK_SIZE) || 1500,
-    STATS_CHUNK_OVERLAP: Number(process.env.STATS_CHUNK_OVERLAP) || 200,
-    DEFAULT_CHUNK_SIZE: Number(process.env.DEFAULT_CHUNK_SIZE) || 800,
-    DEFAULT_CHUNK_OVERLAP: Number(process.env.DEFAULT_CHUNK_OVERLAP) || 150,
-    CHILD_CHUNK_SIZE: Number(process.env.CHILD_CHUNK_SIZE) || 400,
-    CHILD_CHUNK_OVERLAP: Number(process.env.CHILD_CHUNK_OVERLAP) || 50,
-    STATS_CHILD_CHUNK_SIZE: Number(process.env.STATS_CHILD_CHUNK_SIZE) || 400,
-    STATS_CHILD_CHUNK_OVERLAP:
-      Number(process.env.STATS_CHILD_CHUNK_OVERLAP) || 50,
+    STATS_CHUNK_SIZE: statsChunkSize,
+    STATS_CHUNK_OVERLAP: statsChunkOverlap,
+    DEFAULT_CHUNK_SIZE: defaultChunkSize,
+    DEFAULT_CHUNK_OVERLAP: defaultChunkOverlap,
+    CHILD_CHUNK_SIZE: childChunkSize,
+    CHILD_CHUNK_OVERLAP: childChunkOverlap,
+    STATS_CHILD_CHUNK_SIZE: statsChildChunkSize,
+    STATS_CHILD_CHUNK_OVERLAP: statsChildChunkOverlap,
     FETCH_TIMEOUT_MS: Number(process.env.FETCH_TIMEOUT_MS) || 15000,
     RETRY_ATTEMPTS: Number(process.env.RETRY_ATTEMPTS) || 3,
     RETRY_BASE_DELAY_MS: Number(process.env.RETRY_BASE_DELAY_MS) || 1000,

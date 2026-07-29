@@ -71,6 +71,11 @@ export const createCollection = async (
         dimension: vectorDimensions,
         metric: similarityMetric,
       },
+      lexical: { enabled: true, analyzer: "standard" },
+      rerank: {
+        enabled: true,
+        service: { provider: "nvidia", modelName: "nvidia/llama-3.2-nv-rerankqa-1b-v2" },
+      },
     });
     console.log(res);
     return vectorDimensions;
@@ -100,6 +105,11 @@ export const createCollection = async (
           vector: {
             dimension: vectorDimensions,
             metric: similarityMetric,
+          },
+          lexical: { enabled: true, analyzer: "standard" },
+          rerank: {
+            enabled: true,
+            service: { provider: "nvidia", modelName: "nvidia/llama-3.2-nv-rerankqa-1b-v2" },
           },
         });
         console.log(res);
