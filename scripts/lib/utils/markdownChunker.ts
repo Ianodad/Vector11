@@ -58,6 +58,11 @@ const STYLE_B_RE = /^Tags:.*#(?:league|season|type)\//i;
 // corpus is 1.473 UTF-8 bytes per char, so the char-based sizes alone are not a guarantee.
 export const MAX_CHUNK_BYTES = 7000;
 
+// Room reserved for real row content when re-prepending a table header onto
+// a raw-cut continuation piece. Below this, the header would eat the whole
+// cut budget and leave no room for even one multibyte code point.
+const MIN_ROW_CONTENT_BUDGET_BYTES = 64;
+
 const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
 
 export const containsTableRow = (text: string): boolean => TABLE_LINE_ANYWHERE_RE.test(text);
@@ -510,9 +515,13 @@ export const splitMarkdownAware = async (
       const headLines = separator !== null ? [header, separator] : [header];
       const headPrefix = headLines.join("\n") + "\n";
       const headPrefixBytes = byteLen(headPrefix);
-      // Only prepend the header on continuation pieces when the header itself
-      // fits within the budget (an 8 KB header cannot be its own solution).
-      const canAddHeader = headPrefixBytes < MAX_CHUNK_BYTES;
+      // Only prepend the header on continuation pieces when doing so still
+      // leaves room for at least a few code points of real row content — an
+      // 8 KB header cannot be its own solution, and re-prepending a header
+      // that eats the whole cut budget is what caused the zero-progress hang
+      // (cut backs off to the header boundary, remainder is unchanged, the
+      // next iteration recreates the exact same input forever).
+      const canAddHeader = headPrefixBytes <= MAX_CHUNK_BYTES - MIN_ROW_CONTENT_BUDGET_BYTES;
 
       const tPieces = packTableRows(null, header, separator, rows, MAX_CHUNK_BYTES);
       for (const tPiece of tPieces) {
@@ -525,19 +534,31 @@ export const splitMarkdownAware = async (
         // Single row (+ header) still exceeds ceiling — raw-cut in a loop.
         // The first cut naturally includes the header because tPiece starts
         // with it. On every subsequent cut we re-prepend the header so that
-        // each piece retains its table context.
+        // each piece retains its table context — but only while `addHeader`
+        // stays true. Forward-progress guarantee (belt and braces on top of
+        // the canAddHeader budget above): if a cut fails to consume at least
+        // one byte of the header-less remainder, we permanently stop
+        // re-prepending the header for the rest of this piece and fall back
+        // to raw-cutting the bare remainder, which utf8SafeCut always shrinks
+        // by at least one code point when the budget exceeds it — so this
+        // loop is provably terminating for any header size or content.
         let rem = tPiece;
+        let addHeader = canAddHeader;
         while (rem.length > 0) {
           if (byteLen(rem) <= MAX_CHUNK_BYTES) {
             const trimmed = rem.trim();
             if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
             break;
           }
+          const bareRemainderBefore = addHeader ? rem.slice(headPrefix.length) : rem;
           const { cut, remainder } = utf8SafeCut(rem, MAX_CHUNK_BYTES);
           const trimmed = cut.trim();
           if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
           if (remainder.length === 0) break;
-          rem = canAddHeader ? headPrefix + remainder : remainder;
+          if (addHeader && remainder.length >= bareRemainderBefore.length) {
+            addHeader = false;
+          }
+          rem = addHeader ? headPrefix + remainder : remainder;
         }
       }
     } else {

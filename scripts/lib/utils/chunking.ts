@@ -69,23 +69,65 @@ const prependPrefix = (text: string, prefix: string): string => {
   return `${prefix}${text}`;
 };
 
-// Enforces the 8,000-byte Astra ceiling on the fully-prefixed document. If the
-// prefix + chunk ever breaches it, the CHUNK is truncated (never the prefix,
-// which carries the season/league context) via the same utf8SafeCut used
-// everywhere else — no second truncation path.
-const enforceDocByteLimit = (prefix: string, chunk: string, source: string, url: string): string => {
-  const full = prependPrefix(chunk, prefix);
-  if (Buffer.byteLength(full, "utf8") <= MAX_DOCUMENT_BYTES) return full;
+// Reserved so a pathological prefix (e.g. an abnormally long League/Season/
+// Source line) can never itself consume the entire per-record budget — every
+// split piece keeps at least this many bytes of real chunk content, which is
+// also what guarantees the split loop below terminates for any input.
+const MIN_CHUNK_BUDGET_BYTES = 1024;
 
-  const prefixPortion = full.startsWith(prefix) ? prefix : (full.split("\n")[0] ?? "");
-  const chunkPortion = full.slice(prefixPortion.length);
-  const budget = Math.max(0, MAX_DOCUMENT_BYTES - Buffer.byteLength(prefixPortion, "utf8"));
-
+// Caps `prefix` when it alone would leave less than MIN_CHUNK_BUDGET_BYTES of
+// room within MAX_DOCUMENT_BYTES. Metadata tail loss here is acceptable (and
+// logged loudly); chunk content loss is not. Pure/deterministic so callers
+// that need the same capped prefix (splitOversizedText and
+// enforceDocByteLimit) always agree on it.
+const capPrefix = (prefix: string, source: string, url: string): string => {
+  const maxPrefixBytes = MAX_DOCUMENT_BYTES - MIN_CHUNK_BUDGET_BYTES;
+  if (Buffer.byteLength(prefix, "utf8") <= maxPrefixBytes) return prefix;
   console.warn(
-    `[chunking] chunk exceeded ${MAX_DOCUMENT_BYTES}-byte ceiling after prefix, truncated. source="${source}" url="${url}"`,
+    `[chunking] prefix exceeded ${maxPrefixBytes}-byte budget, truncated (metadata tail lost, not chunk content). source="${source}" url="${url}"`,
   );
-  const { cut } = utf8SafeCut(chunkPortion, budget);
-  return `${prefixPortion}${cut}`;
+  return utf8SafeCut(prefix, maxPrefixBytes).cut;
+};
+
+// True backstop: by the time this runs, call sites are expected to have
+// already pre-split any oversized text via splitOversizedText, so
+// prefix + chunk should always already fit. If it doesn't, a call site
+// skipped the pre-split — throw instead of the old truncate-and-discard
+// behaviour, so the 8,000-byte invariant fails fast and loudly rather than
+// silently shipping a corrupt or content-lossy record.
+const enforceDocByteLimit = (prefix: string, chunk: string, source: string, url: string): string => {
+  const usablePrefix = capPrefix(prefix, source, url);
+  const full = prependPrefix(chunk, usablePrefix);
+  if (Buffer.byteLength(full, "utf8") <= MAX_DOCUMENT_BYTES) return full;
+  throw new Error(
+    `[chunking] invariant violated: prefix + chunk still exceeds ${MAX_DOCUMENT_BYTES} bytes after pre-split. source="${source}" url="${url}"`,
+  );
+};
+
+// When `prefix + text` would exceed MAX_DOCUMENT_BYTES, splits `text` (never
+// the prefix, unless the prefix itself is pathologically large — see
+// capPrefix) into multiple raw pieces using the same code-point-safe
+// utf8SafeCut used everywhere else. Replaces the old truncate-and-discard
+// semantics: ALL of `text` reappears across the returned pieces, nothing is
+// dropped. Returns `[text]` unchanged in the overwhelming common case, since
+// splitMarkdownAware already caps chunks well under this ceiling before the
+// prefix is added.
+const splitOversizedText = (prefix: string, text: string, source: string, url: string): string[] => {
+  const full = prependPrefix(text, prefix);
+  if (Buffer.byteLength(full, "utf8") <= MAX_DOCUMENT_BYTES) return [text];
+
+  const usablePrefix = capPrefix(prefix, source, url);
+  const budget = MAX_DOCUMENT_BYTES - Buffer.byteLength(usablePrefix, "utf8");
+
+  const pieces: string[] = [];
+  let rem = text;
+  while (true) {
+    const { cut, remainder } = utf8SafeCut(rem, budget);
+    pieces.push(cut);
+    if (remainder.length === 0) break;
+    rem = remainder;
+  }
+  return pieces;
 };
 
 // The minimum-length filter exists to drop stray fragments, not table rows —
@@ -124,30 +166,46 @@ export const createParentChildChunks = async (
   for (const parent of filteredParents) {
     const parentMeta = resolveMeta(parent.meta, docMeta);
     const parentPrefix = buildChunkPrefix(parentMeta, source);
-    const parentId = createHash("md5").update(parent.text).digest("hex");
-    parentDocs.push({
-      _id: parentId,
-      content: enforceDocByteLimit(parentPrefix, parent.text, source, url),
-      source,
-      url,
-      category,
-      scrapedAt,
-      type: "parent",
-    });
+    // Expand a parent whose prefixed content would exceed the ceiling into
+    // multiple parent pieces BEFORE any record is created, so the loop below
+    // (record creation + child derivation) runs unchanged on already-fitting
+    // text and enforceDocByteLimit becomes a true never-triggers backstop.
+    // In the overwhelming common case this is just `[parent.text]`.
+    const parentTextPieces = splitOversizedText(parentPrefix, parent.text, source, url);
 
-    const childPieces = await splitMarkdownAware(parent.text, childMaxSize, childOverlap);
-    const filteredChildren = childPieces.filter(
-      (c) => passesLengthFilter(c.text, CHILD_MIN_LENGTH) && !isLowValueContent(c.text),
-    );
-    for (const child of filteredChildren) {
-      // Fall back to the PARENT's already-resolved metadata (not straight to
-      // the document level) so a child re-split from a parent whose own text
-      // doesn't repeat the section's **Type:** line still inherits the
-      // correct section, not just whatever came first in the whole document.
-      const childMetaResolved = resolveMeta(child.meta, parentMeta);
-      const childPrefix = buildChunkPrefix(childMetaResolved, source);
-      childTexts.push(enforceDocByteLimit(childPrefix, child.text, source, url));
-      childMeta.push({ parentId });
+    for (const parentTextPiece of parentTextPieces) {
+      // Hash the piece itself (mirrors the original hash-of-text approach),
+      // so each extra parent piece gets its own stable, distinct `_id`.
+      const parentId = createHash("md5").update(parentTextPiece).digest("hex");
+      parentDocs.push({
+        _id: parentId,
+        content: enforceDocByteLimit(parentPrefix, parentTextPiece, source, url),
+        source,
+        url,
+        category,
+        scrapedAt,
+        type: "parent",
+      });
+
+      const childPieces = await splitMarkdownAware(parentTextPiece, childMaxSize, childOverlap);
+      const filteredChildren = childPieces.filter(
+        (c) => passesLengthFilter(c.text, CHILD_MIN_LENGTH) && !isLowValueContent(c.text),
+      );
+      for (const child of filteredChildren) {
+        // Fall back to the PARENT's already-resolved metadata (not straight to
+        // the document level) so a child re-split from a parent whose own text
+        // doesn't repeat the section's **Type:** line still inherits the
+        // correct section, not just whatever came first in the whole document.
+        const childMetaResolved = resolveMeta(child.meta, parentMeta);
+        const childPrefix = buildChunkPrefix(childMetaResolved, source);
+        // Same expansion for an oversized child; each piece gets its own
+        // embedding but keeps the same parentId.
+        const childTextPieces = splitOversizedText(childPrefix, child.text, source, url);
+        for (const childTextPiece of childTextPieces) {
+          childTexts.push(enforceDocByteLimit(childPrefix, childTextPiece, source, url));
+          childMeta.push({ parentId });
+        }
+      }
     }
   }
 
