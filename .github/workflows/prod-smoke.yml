@@ -1,0 +1,34 @@
+name: Prod Smoke Test
+
+# Manually-triggered production health check. Runs from a GitHub runner so it
+# works even when the office network blocks *.vercel.app. Asks the live chat
+# API a standings question and fails if the answer is empty or has no data.
+
+on:
+  workflow_dispatch:
+    inputs:
+      question:
+        description: "Question to send to the chat API"
+        required: false
+        default: "What is the current Premier League table? Give the top 5 teams with points."
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: POST /api/chat on production
+        run: |
+          set -o pipefail
+          Q='${{ inputs.question }}'
+          BODY=$(jq -n --arg q "$Q" '{messages:[{role:"user",content:$q}]}')
+          HTTP=$(curl -s -o resp.txt -w "%{http_code}" --max-time 180 \
+            -H "Content-Type: application/json" \
+            -d "$BODY" https://vector11.vercel.app/api/chat)
+          echo "HTTP $HTTP"
+          echo "---- response (first 6000 chars) ----"
+          head -c 6000 resp.txt; echo
+          echo "-------------------------------------"
+          [ "$HTTP" = "200" ] || { echo "::error::Non-200 from /api/chat"; exit 1; }
+          grep -qiE "liverpool|arsenal|manchester|chelsea|tottenham" resp.txt \
+            || { echo "::error::No team names in response — retrieval likely empty"; exit 1; }
+          echo "Smoke test PASSED — response contains real standings data."
