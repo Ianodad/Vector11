@@ -1,150 +1,194 @@
-# Handoff — Opus 5 — vector11 / retrieval + season + chunking fix
+# Handoff — Fable 5 — vector11 / retrieval + season + chunking fix
 
-**Date:** 2026-07-29, ~20:30 EAT
-**Branch:** `fix/retrieval-season-hybrid` (branched from `main`)
-**Last commit:** `9b89101` — WIP checkpoint, deliberately amber (see Open Flags)
+**Date:** 2026-07-30, ~11:30 EAT (supersedes 2026-07-29 handoff)
+**Branch:** `fix/retrieval-season-hybrid` (branched from `main`, never merged, no push)
+**Last code commit:** `8f05ab1` — seed insert transient retry
+**Verdict of record:** Codex xhigh pre-re-seed review = **NO-GO** (5 BLOCKER / 3 MAJOR / 1 MINOR)
 
 ---
 
 ## Current State
 
-The app was failing **every** user query. Root-caused to 5 stacked bugs, not one.
-Four are fixed and verified live. The fifth (chunking) is committed but **not green** —
-4 validator failures block the re-seed.
+All code gates from the previous handoff went GREEN today, but the final Codex
+review returned **NO-GO on the destructive re-seed**. The re-seed was NOT run.
+Production was NOT redeployed. Nothing destructive happened this session.
 
 | Area | Status |
 |---|---|
-| API: season / hybrid / cold-start / categories | ✅ Fixed, verified live (0/6 → 4/6) |
-| Production `EMBEDDING_DIMENSIONS` 768 → 1536 | ✅ Changed & verified — **NOT redeployed** |
-| Seed pipeline: table-aware chunking + `$lexical` | ⚠️ Committed, 4 validator failures |
-| Re-seed (~2h, destructive) | ❌ NOT run — blocked on the above |
+| API: season / hybrid / cold-start / categories | ✅ Fixed, verified live (previous session, 0/6 → 4/6) |
+| Production `EMBEDDING_DIMENSIONS` 768 → 1536 | ✅ Set in Vercel — **still NOT redeployed, still inert** |
+| Chunker: 4 validator failures | ✅ Fixed (`dd86c73`), validator exit 0, independently verified |
+| Seed inserts: transient-error retry | ✅ Added (`8f05ab1`), tsc/eslint/validator all green |
+| Accuracy gate | ✅ **4/4 vs baseline 3/4** — measured AFTER the rewrite, config-verified temp collection |
+| Codex pre-re-seed review | ❌ **NO-GO** — findings below |
+| Re-seed (~2h, destructive) | ❌ NOT run — blocked by NO-GO |
+| Source research (user request) | ✅ Done → `.planning/research-sources.md` |
 
 ---
 
-## Completed (all independently verified, not taken from executor reports)
+## Completed this session (all independently verified, not taken from executor reports)
 
-### 1. API fixes — `app/api/chat/route.ts`
-Measured on 6 live queries: **0/6 → 4/6 correct**, 2/6 partial.
-
-- **Season semantics.** App computed "current season = 2026-27" while the newest data
-  anywhere is 2025-26 (verified: `understat.com/league/EPL/2026` redirects to 2025).
-  The prompt rule "say it is unavailable" then fired on every query. Now: 2025-26 is
-  the latest COMPLETE season; never refuse just because a not-yet-started season is empty.
-  10 boundary dates unit-tested incl. the Aug 1–7 gap.
-- **Hybrid retrieval.** Replaced cosine + `gpt-5-mini` reranker with Astra
-  `findAndRerank` + `$hybrid` + the collection's NVIDIA reranker.
-  Measured discrimination on the correct standings table: **+20.48 vs −0.78**,
-  where cosine gave 0.899 vs 0.884 (indistinguishable). Old LLM rerank call deleted.
-  Pure-vector path retained as fallback.
-- **Cold start.** Astra resumes in TWO stages: ~19s of HTTP 400 "resuming", then reads
-  failing with `UNAVAILABLE_DATABASE` / `LOCAL_QUORUM`. Old retry budget was 9s and
-  matched stage 1 only. Now covers both and returns an honest **503** instead of
-  answering confidently with empty context. `maxDuration = 60` added.
-- **Categories.** `playerPerformance` had **0 documents** but was filtered on constantly.
-  Aligned to real DB categories; `reference`(1567) / `soccerwayForm`(214) / `rss`(88)
-  are no longer unreachable.
-
-### 2. Production dimension fix (highest-value, free)
-Verified via Vercel CLI, not assumed:
-```
-BEFORE: EMBEDDING_DIMENSIONS="768"     ← every prod query broken at the vector level
-AFTER:  EMBEDDING_DIMENSIONS="1536"    ← pulled back and confirmed
-```
-Set on Production, Preview AND Development. Added with `--no-sensitive` so it stays
-auditable. **Requires a redeploy to take effect — not done.**
-
-### 3. Tooling
-- **Astra CLI v1.1.0** at `~/.astra/cli/astra`, profile `vector11` is default.
-  `astra setup` cannot run non-interactively — use `astra config create <name> -t @file`.
-  `describe-collection` does NOT expose vector dimension; use the SDK.
-- **Vercel CLI 58.3.0**, project linked (`ian-odhaimbos-projects/vector11`).
-  ⚠️ `vercel link` writes `.env.local` with secrets into the repo — gitignored by `.env*`,
-  but delete it anyway. Pull env to a temp dir OUTSIDE the repo.
-
-### 4. Measured facts about Astra (established by live testing — do not re-derive)
-- Collection `vector11gpt`: **1536 dims, dot_product, lexical + rerank ENABLED**.
-- **Astra rejects any indexed String field over 8,000 BYTES.** `content` and `$lexical`
-  are both indexed → both capped. Worst UTF-8 ratio in this corpus: **1.473 bytes/char**,
-  so the ceiling hits at ~5,429 chars.
-- Writing `$lexical` activates BM25 (`$bm25Rank` goes from `null` → a real rank).
-- New chunking yields **1.73× more documents** (211 → 364 for Understat EPL);
-  collection would go ~10,209 → ~17,700. Fine for Astra.
-- Cold resume measured at **18.7s** to first success.
+1. **Chunker fixed** (`dd86c73`). All 4 validator failures resolved by a Sonnet
+   executor subagent. Root cause beyond the 4 spec bugs: `utf8SafeCut` used
+   `chars.indexOf(ch)` to find the cut index — always 0 on repeated characters —
+   which caused the cascading 24 KB remainder. Verified myself: `validateChunking`
+   exit 0, `tsc --noEmit` clean, `eslint scripts/` 0 errors (4 pre-existing
+   htmlScraper warnings only).
+2. **Accuracy gate passed: 4/4 vs baseline 3/4** (`_accuracy.ts new`, ~10:30 EAT).
+   The previously-failing probe (Arsenal 85-pt standings row intact on one line)
+   passes with the new chunking. Max real-corpus chunk: 1,583 bytes (cap 8,000).
+   Baseline mode re-confirmed 3/4 against live `vector11gpt` the same morning.
+3. **Seed insert retry** (`8f05ab1`): `operations.ts` insertMany batches now retry
+   transient Astra errors (max 6, linear backoff 10s–50s); duplicate + size-limit
+   handling unchanged; idempotent because duplicate `_id`s are tolerated.
+4. **`_accuracy.ts` hardened** (untracked by design): verifies temp-collection
+   lexical+rerank config before seeding (drops/recreates if partial), retries
+   transient inserts, polls for materialization after server-side create timeouts.
+5. **Source research** → `.planning/research-sources.md`. Top picks:
+   football-data.org (replaces all 31 soccerway + 3 worldfootball URLs),
+   ESPN public JSON API (verified alive today, no key), Wikipedia MediaWiki API
+   (replaces 18 HTML scrapes), API-Football free tier (covers the 12 blocked
+   URLs + CAF/African gap), openfootball JSON. FotMob & Sofascore ToS PROHIBIT
+   scraping — excluded.
 
 ---
 
-## Remaining — the ONE blocking task
+## Astra serverless failure modes (measured live 2026-07-30 morning — do not re-derive)
 
-`npx tsx scripts/validateChunking.ts` → **4 failures**. Spec already written:
-**`.planning/task-chunker-final.md`** (precise, with reproductions). All four trace to the
-"last-line defence" byte-ceiling loop at the end of `splitMarkdownAware`
-(`scripts/lib/utils/markdownChunker.ts`, ~lines 448-472):
+- `createCollection` can time out **SERVER-side** (`PT30S`, NOT tunable from the
+  client — client `timeout: 180000` did not help) and then **materialize with
+  PARTIAL config**: collection exists, but lexical/rerank missing → every
+  `findAndRerank` `$hybrid` query fails with "syntactically correct…" errors.
+  Always **verify config via `listCollections()` definitions** after create.
+- Truncate (`deleteMany({})`) needs ALL replicas: fails with "Truncate failed on
+  replica /10.x.x.x"; Astra says safe to retry.
+- CAS write timeouts in bursts: `LOCAL_SERIAL 3 replica were required but only 0
+  acknowledged`, plus composite `java.lang.NullPointerException`. Every batch
+  failed at least once in the flaky window; all succeeded on retry within 10–30s.
+- DB stabilized by ~10:15 EAT (clean provisioning round, baseline queries fine).
 
-1. **Final flush is uncapped (CRITICAL).** Trailing `pendingText` is pushed without
-   `utf8SafeCut` → produced a **24,046-byte chunk**, which Astra would reject outright.
-   Must loop: one cut = one chunk, so a 24 KB remainder needs 4 chunks.
-2. **Per-chunk cut is single-pass** — make it a `while` loop.
-3. **Content loss at `overlap=0`** — reproduce:
-   `splitMarkdownAware("a".repeat(399) + "😀" + " tail text", 400, 0)`
-   → stripped input 409 chars, output 401; `" tail text"` vanishes.
-   Cause: the trailing branch is guarded by `processedChunks.length > 0` and `.trim()`.
-4. **Byte-cut table pieces lose their header** — the ceiling pass is generic text surgery
-   and header-unaware. Must re-use `packTableRows`/`buildPiece` so continuation pieces
-   repeat the header.
+---
+
+## The NO-GO: Codex findings (full text in `.planning/executor-out*` era ends; verdict reproduced here)
+
+**BLOCKERs**
+1. **Table byte-ceiling loop can make ZERO progress → hang/OOM**
+   (`markdownChunker.ts:529`): a ~6,999-byte header prefix leaves no room for a
+   multibyte code point; re-prepending the header recreates the same remainder
+   forever. Codex reproduced a timeout in isolation. (Not triggered by the real
+   corpus — max real chunk 1,583 bytes — but a hang mid-seed is catastrophic.)
+2. **8,000-byte invariant still breakable via unbounded prefix**
+   (`chunking.ts:76`): oversized prefix → oversized `content`/`$lexical`
+   (8,074-byte records reproduced); `enforceDocByteLimit` can also DISCARD the
+   remainder (adversarial marker vanished from all parents/children).
+3. **Failed collection drops are swallowed** (`collection.ts:55`): warn+continue
+   on replica/truncate failure → creation finds the surviving collection, checks
+   ONLY dimension → seeds into old/wrong-config data. **Matches the live truncate
+   failure mode we measured.**
+4. **Collection creation neither retried nor post-verified** (`collection.ts:68`,
+   `:87`): PT30S partial materialization can leave a broken collection that a
+   later run accepts (dimension-only check; metric/lexical/rerank unverified).
+   **Matches the live partial-config failure we proved with the temp collection.**
+5. **Rebuild is in-place and non-atomic** (`loadDb.ts:273`): orphan parents /
+   partial children on mid-run death; no staging collection, rollback, completion
+   marker, or expected-count assertion; summary omits `failedUrls`. (Pre-existing
+   architecture, not introduced by this branch.)
+
+**MAJORs**
+6. Retry triage classifies only the AGGREGATE error message
+   (`operations.ts:43`): `CollectionInsertManyError` exposes only the FIRST
+   cause — a duplicate-first batch containing a size error records zero skips;
+   `recordsAdded` undercounts writes committed by a timed-out attempt (20 stored
+   reported as 19).
+7. Parent IDs hash unprefixed text (`chunking.ts:127`) while stored content is
+   prefixed → same text from two sources collides; second source's children point
+   at first source's parent. (Pre-existing.)
+8. Destructive mode + 1536 dims are not fail-fast invariants (`env.ts:122`):
+   local env has recreate flags UNSET → plain `npm run seed` would seed INTO the
+   existing collection, not drop it. (The GitHub workflow sets
+   `ALLOW_COLLECTION_RECREATE=true`; local does not.)
+
+**MINOR**
+9. The validator passes while missing all of the above (permits truncation at
+   `validateChunking.ts:376`; presence-only checks). Also: trailing whitespace at
+   `validateChunking.ts:395` and `:589` (`git diff --check` fails).
+
+---
+
+## Decision framework (pre-committed last session, now TRIGGERED)
+
+Last handoff said: review rounds found 11 → 5 → 4 defects; *"if the next round
+finds genuinely NEW classes of defect, consider abandoning the custom chunker and
+shipping only the API fixes (already proven)."* This round found new CLASSES
+(liveness hang, lifecycle atomicity). The rule has triggered — but note the split:
+
+- **Chunker-specific blockers (1, 2)**: adversarial-input bugs; the REAL corpus
+  measured clean (1,583-byte max) and accuracy is 4/4. Bounded fix.
+- **Lifecycle blockers (3, 4)**: NOT chunker bugs; they exist on `main` too and
+  match failure modes we PROVED live. These must be fixed before ANY re-seed,
+  custom chunker or not.
+- **Blocker 5**: pre-existing architecture; mitigation (staging collection or
+  count assertions) is a design choice for the orchestrator.
+
+### Options for next session (orchestrator decision, in rec order)
+- **A (recommended): ship the free win first.** `vercel --prod` redeploys with
+  `EMBEDDING_DIMENSIONS=1536` → fixes production's vector-level breakage against
+  the EXISTING collection with zero re-seed risk. (Deploys current prod codebase;
+  the branch's API fixes ship when the branch merges — user's call.)
+- **B: fix blockers 1–4 (+ trailing whitespace), strengthen the validator per
+  finding 9, re-run validator + accuracy, re-review with Codex, THEN re-seed.**
+  Realistic: one focused executor round each for chunker (1–2) and lifecycle (3–4).
+- **C: abandon the custom chunker** per the pre-committed rule and re-seed with
+  the old chunking once lifecycle blockers 3–4 are fixed. Loses the measured
+  4/4-vs-3/4 accuracy gain; keeps the proven API fixes.
 
 ---
 
 ## Open Flags
 
-- **DO NOT RE-SEED** until the validator exits 0. A re-seed drops ~10,000 docs and rebuilds
-  over ~2 hours; bug #1 alone would cause insert rejections mid-run.
-- **Production not redeployed.** The 768→1536 fix is inert until `vercel --prod`.
-- **`_accuracy.ts`** (repo root, untracked) is the retrieval-accuracy harness.
-  `npx tsx _accuracy.ts baseline` → live collection. `npx tsx _accuracy.ts new` → builds a
-  temp collection with the new chunking, measures, drops it. **Baseline was 3/4; new chunking
-  measured 4/4** — but that was measured BEFORE the rewrite. **Must be re-run after the
-  chunker is green.**
-- **Executor lanes:** second account quota reset at 8pm EAT. Last Sonnet dispatch failed with
-  `API Error: ENOTFOUND` (network, not quota) — simply retry.
-- **GLM-4.7 made the chunker WORSE** (4 failures → 7). Reverted via
-  `git checkout -- scripts/lib/utils/markdownChunker.ts`. Prefer Sonnet for this work.
-- **`package-lock.json` deletion and `pnpm-lock.yaml`** were pre-existing at session start —
-  deliberately NOT staged, so this branch doesn't absorb unrelated changes.
-- Codex review found and I confirmed: 3 rounds of chunker review found 11 → 5 → 4 defects.
-  If the next round finds genuinely NEW classes of defect, consider abandoning the custom
-  chunker and shipping only the API fixes (already proven).
+- **DO NOT RE-SEED** — NO-GO stands until blockers are resolved and Codex re-reviews.
+- **Production still broken** at the vector level until a redeploy ships the
+  1536 dimension env var (Option A is free and safe).
+- Plain local `npm run seed` would NOT drop the collection anyway (recreate flags
+  unset locally — finding 8). The destructive path is the GitHub workflow.
+- `_accuracy.ts` stays deliberately untracked; it now contains the hardened
+  provisioning logic — don't overwrite it casually.
+- `package-lock.json` deletion + `pnpm-lock.yaml` remain pre-existing/unstaged.
+- Executor lane note: `dispatch-second.sh` FAILS from this session (already on
+  second account) — use a `sonnet-executor` subagent instead (same quota pool).
+- Trailing whitespace in `validateChunking.ts` (395, 589) fails `git diff --check`.
 
 ---
 
-## Critical Context / gotchas
+## Critical Context / gotchas (carried forward + new)
 
-- **Do not trust executor self-reports.** Every round, verification caught something the
-  report claimed was done. Two of my own test harnesses also produced FALSE GREENS:
-  a ground-truth regex that read Arsenal's points as `"7"` (so everything "passed"), and
-  GLM writing `c.text.includes("")` — an empty string, which every string contains.
-- **Astra hibernates.** Run `astra db resume Vector11` BEFORE seeding rather than relying on
-  retry logic.
-- Understat concatenates standings + player stats + fixtures into ONE document with three
-  `> **Type:**` headers — this is why metadata must be per-SECTION, not per-document.
-- Scraper decay (unaddressed): of 105 source URLs, **82 OK / 11 blocked (403: fbref,
-  worldfootball, soccerstats) / 3 dead / 4 timeouts**. Season URLs are hardcoded to
-  `/2024`, `/2025` — nothing rolls forward.
+- **Do not trust executor self-reports** — every round this has caught something.
+  (This session both executor reports survived independent verification.)
+- Astra hibernates; `astra db resume Vector11` before any DB work. DB was flaky
+  for ~90 min after resume this morning — build in warm-up tolerance.
+- Understat concatenates standings+players+fixtures into ONE doc with three
+  `> **Type:**` headers → metadata must stay per-SECTION.
+- Scraper decay: 82/105 URLs OK; 11 blocked (403), 3 dead, 4 timeouts; season
+  URLs hardcoded `/2024`, `/2025`. Fix path researched →
+  `.planning/research-sources.md` (football-data.org, ESPN JSON, MediaWiki API,
+  API-Football, openfootball; FotMob/Sofascore prohibited).
 
 ---
 
 ## Git State
 
 ```
-branch : fix/retrieval-season-hybrid
-commit : 9b89101  "WIP: hybrid retrieval, season semantics, cold-start handling,
-                   table-aware chunking"   (26 files, +3709/-305)
-clean  : yes, except intentionally-unstaged pre-existing changes:
-           D package-lock.json     (pre-existing, not ours)
-           ?? pnpm-lock.yaml       (pre-existing, not ours)
-           ?? _accuracy.ts         (our test harness, keep untracked or commit separately)
-           ?? .planning/*.err      (executor stderr logs, noise)
+branch : fix/retrieval-season-hybrid   (never merged, no push)
+commits this session:
+  8f05ab1  fix: retry transient Astra errors in seed insert batches
+  dd86c73  fix: chunker byte-ceiling loop — cap final flush, header-aware
+           table cuts, no content loss
+prior:
+  b92ad2c  docs: session handoff (2026-07-29)
+  9b89101  WIP: hybrid retrieval, season semantics, cold-start, chunking
+unstaged (pre-existing, deliberate): D package-lock.json, ?? pnpm-lock.yaml
+untracked (ours, deliberate): _accuracy.ts, .planning/*.err noise
 ```
-Never merged to `main`. No push.
 
 ---
 
@@ -152,33 +196,22 @@ Never merged to `main`. No push.
 
 ```bash
 cd /data/Documents/vector11
-git log --oneline -1                      # expect 9b89101
-npx tsx scripts/validateChunking.ts       # expect 4 failures
+git log --oneline -2        # expect 8f05ab1, dd86c73
+npx tsx scripts/validateChunking.ts   # expect exit 0
 
-# 1. Fix the chunker — spec is already written and precise:
-~/.claude/scripts/dispatch-second.sh \
-  -o .planning/executor-out9.md \
-  -f .planning/task-chunker-final.md \
-  -C /data/Documents/vector11
-
-# 2. Verify (must ALL pass before anything else)
-npx tsc --noEmit
-npx eslint scripts/
-npx tsx scripts/validateChunking.ts       # MUST exit 0
-npx tsx _accuracy.ts new                  # MUST still be 4/4
-
-# 3. Commit the green checkpoint immediately (an earlier good state was lost
-#    to an overwrite because it was never committed)
-
-# 4. Codex review before the destructive step
-codex exec -c model_reasoning_effort=xhigh --sandbox read-only \
-  "Final pre-re-seed review of scripts/ ... GO or NO-GO"
-
-# 5. Only on GO:
-astra db resume Vector11                  # avoid the 19s cold start
-npm run seed                              # ~2 HOURS, drops+rebuilds ~10k docs
-vercel --prod                             # ships the 768->1536 dimension fix too
+# FIRST DECISION (orchestrator): pick Option A / B / C above.
+# A is free: vercel --prod   (ships 1536 dims against existing collection)
+# B work order:
+#   1. spec + dispatch: chunker blockers 1-2  (markdownChunker.ts:529, chunking.ts:76)
+#   2. spec + dispatch: lifecycle blockers 3-4 (collection.ts:55/68/87 — verify
+#      drop succeeded via listCollections; post-verify created config:
+#      dimension+metric+lexical+rerank; retry create)
+#   3. strengthen validateChunking per finding 9 (order/count, no truncation carve-out)
+#   4. re-run: validator, tsc, eslint, _accuracy.ts new (expect 4/4)
+#   5. Codex xhigh re-review → only on GO: astra db resume Vector11 && re-seed
+#      via the WORKFLOW path (it sets ALLOW_COLLECTION_RECREATE=true), then vercel --prod
 ```
 
-**Next single action:** re-dispatch `.planning/task-chunker-final.md` to Sonnet
-(the last attempt died on a network error, not a logic problem).
+**Next single action:** decide A/B/C. Recommendation: A immediately (free,
+unbreaks prod), then B (the accuracy gain is real and the blocker fixes are
+bounded).
