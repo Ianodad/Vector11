@@ -5,7 +5,6 @@ import "dotenv/config";
 import { loadEnvConfig, resolveMaxUrls, isEnabled } from "./lib/config/env.js";
 import { initializeClients } from "./lib/config/clients.js";
 import { buildFootballDataList } from "./lib/config/dataSources.js";
-import { initializeSplitters } from "./lib/embeddings/splitters.js";
 
 // Database
 import { createCollection, waitForDbReady } from "./lib/database/collection.js";
@@ -56,7 +55,6 @@ const processDataSources = async (
   footballData: SourceItem[],
   config: ReturnType<typeof loadEnvConfig>,
   clients: ReturnType<typeof initializeClients>,
-  splitters: ReturnType<typeof initializeSplitters>,
   vectorDimensions: number,
 ): Promise<{
   processedUrls: number;
@@ -65,7 +63,12 @@ const processDataSources = async (
   recordsAdded: number;
   parentsAdded: number;
   childrenAdded: number;
+  recordsSkipped: number;
+  recordsDuplicated: number;
   totalEmbeddingTokens: number;
+  skippedUrls: number;
+  failedUrls: number;
+  attemptedRecords: number;
 }> => {
   const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
   const queue: SourceItem[] = [...footballData];
@@ -75,11 +78,17 @@ const processDataSources = async (
   let recordsAdded = 0;
   let parentsAdded = 0;
   let childrenAdded = 0;
+  let recordsSkipped = 0;
+  let recordsDuplicated = 0;
   let totalEmbeddingTokens = 0;
   const urlChunkStats: Record<string, { parents: number; children: number }> = {};
   const processedUrlList: string[] = [];
   let skippedUrls = 0;
   let failedUrls = 0;
+  // Sum of parent+child chunks attempted for insertion (whether or not the
+  // insert ultimately succeeded) — used as the basis for the end-of-run
+  // sanity assertion against recordsAdded (see BLOCKER 5 mitigation).
+  let attemptedRecords = 0;
 
   for (let i = 0; i < queue.length; i += 1) {
     const { url, type, source, delay = 2, category = "unknown", formMode, formMatches } = queue[i];
@@ -222,13 +231,23 @@ const processDataSources = async (
     }
 
     // Parent-child chunking
-    const parentSplitter = isStats ? splitters.statsSplitter : splitters.defaultSplitter;
-    const childSplitter = isStats ? splitters.statsChildSplitter : splitters.defaultChildSplitter;
+    const chunkSizes = isStats
+      ? {
+          parentMaxSize: config.STATS_CHUNK_SIZE,
+          parentOverlap: config.STATS_CHUNK_OVERLAP,
+          childMaxSize: config.STATS_CHILD_CHUNK_SIZE,
+          childOverlap: config.STATS_CHILD_CHUNK_OVERLAP,
+        }
+      : {
+          parentMaxSize: config.DEFAULT_CHUNK_SIZE,
+          parentOverlap: config.DEFAULT_CHUNK_OVERLAP,
+          childMaxSize: config.CHILD_CHUNK_SIZE,
+          childOverlap: config.CHILD_CHUNK_OVERLAP,
+        };
 
     const chunkingResult = await createParentChildChunks(
       content,
-      parentSplitter,
-      childSplitter,
+      chunkSizes,
       source,
       url,
       category,
@@ -246,6 +265,7 @@ const processDataSources = async (
     console.log(
       `  Chunking ${url} -> parents=${parentDocs.length} children=${childTexts.length} meta=${childMeta.length}`,
     );
+    attemptedRecords += parentDocs.length + childTexts.length;
 
     try {
       // Generate embeddings
@@ -264,6 +284,8 @@ const processDataSources = async (
       const parentResult = await batchInsertParents(collection, parentDocs);
       recordsAdded += parentResult.recordsAdded;
       parentsAdded += parentResult.recordsAdded;
+      recordsSkipped += parentResult.recordsSkipped;
+      recordsDuplicated += parentResult.recordsDuplicated;
 
       // Insert child docs
       const scrapedAt = new Date().toISOString();
@@ -279,6 +301,8 @@ const processDataSources = async (
       );
       recordsAdded += childResult.recordsAdded;
       childrenAdded += childResult.recordsAdded;
+      recordsSkipped += childResult.recordsSkipped;
+      recordsDuplicated += childResult.recordsDuplicated;
 
       // Track per-URL chunk counts for the summary
       urlChunkStats[url] = {
@@ -305,7 +329,20 @@ const processDataSources = async (
     await sleep(delay);
   }
 
-  return { processedUrls, processedUrlList, urlChunkStats, recordsAdded, parentsAdded, childrenAdded, totalEmbeddingTokens };
+  return {
+    processedUrls,
+    processedUrlList,
+    urlChunkStats,
+    recordsAdded,
+    parentsAdded,
+    childrenAdded,
+    recordsSkipped,
+    recordsDuplicated,
+    totalEmbeddingTokens,
+    skippedUrls,
+    failedUrls,
+    attemptedRecords,
+  };
 };
 
 const seed = async () => {
@@ -320,7 +357,6 @@ const seed = async () => {
   // Load configuration
   const config = loadEnvConfig();
   const clients = initializeClients(config);
-  const splitters = initializeSplitters(config);
   const allFootballData = buildFootballDataList(
     config.EPL_TEAMS_ENABLED,
     config.EPL_TEAM_PAGES,
@@ -387,10 +423,49 @@ const seed = async () => {
   );
 
   // Process data sources
-  const { processedUrls, processedUrlList, urlChunkStats, recordsAdded, parentsAdded, childrenAdded, totalEmbeddingTokens } =
-    await processDataSources(footballData, config, clients, splitters, vectorDimensions);
+  const {
+    processedUrls,
+    processedUrlList,
+    urlChunkStats,
+    recordsAdded,
+    parentsAdded,
+    childrenAdded,
+    recordsSkipped,
+    recordsDuplicated,
+    totalEmbeddingTokens,
+    skippedUrls,
+    failedUrls,
+    attemptedRecords,
+  } = await processDataSources(footballData, config, clients, vectorDimensions);
 
   const durationMs = Date.now() - startedAt;
+
+  // A silent partial seed must be impossible: any document Astra rejected for
+  // exceeding its 8,000-byte indexed field limit was logged per-document above
+  // and is summed here as one unmissable end-of-run total.
+  console.log(`\nSkipped ${recordsSkipped} oversized documents`);
+  console.log(`Duplicated ${recordsDuplicated} documents (same content-hash _id, tolerated by design)`);
+  console.log(`Skipped URLs: ${skippedUrls} | Failed URLs: ${failedUrls}`);
+
+  // The in-place, non-atomic rebuild (no transactional guarantee across the
+  // whole run) means a failed URL or a partial insert can otherwise slip by
+  // silently. These are cheap safety rails, not a redesign: surface failures
+  // loudly and fail CI instead of reporting a quiet success.
+  if (failedUrls > 0) {
+    console.warn(
+      `\n⚠️  ${failedUrls} URL(s) failed to process — seed completed but is INCOMPLETE. Check logs above for per-URL errors.`,
+    );
+    process.exitCode = 1;
+  }
+
+  const expectedRecordsAdded = attemptedRecords - recordsSkipped - recordsDuplicated;
+  if (recordsAdded !== expectedRecordsAdded) {
+    console.warn(
+      `\n⚠️  Record count mismatch: recordsAdded=${recordsAdded} but expected ${expectedRecordsAdded} ` +
+        `(attempted=${attemptedRecords} - oversizedSkipped=${recordsSkipped} - duplicated=${recordsDuplicated}). This indicates a silent partial insert.`,
+    );
+    process.exitCode = 1;
+  }
 
   // Log summary
   logSummary({
@@ -419,8 +494,16 @@ const seed = async () => {
 
 seed()
   .then(() => {
-    console.log("✅ loadDb completed. Exiting.");
-    process.exit(0);
+    // seed() sets process.exitCode = 1 (without throwing) when it detects
+    // failed URLs or a record-count mismatch — respect that here instead of
+    // hardcoding a 0 exit, otherwise those warnings never fail CI.
+    const code = process.exitCode ?? 0;
+    console.log(
+      code === 0
+        ? "✅ loadDb completed. Exiting."
+        : "⚠️  loadDb completed with warnings (see above). Exiting non-zero.",
+    );
+    process.exit(code);
   })
   .catch((error: unknown) => {
     console.error("Seed failed:", error);
