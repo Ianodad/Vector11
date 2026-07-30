@@ -46,9 +46,10 @@ jobs:
           OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
           EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1536' }}
           ALLOW_COLLECTION_RECREATE: ${{ vars.ALLOW_COLLECTION_RECREATE || 'true' }}
-          # Destructive rebuild is opt-in PER RUN via the dispatch input; the
-          # repo variable remains a fallback but scheduled runs stay additive.
-          FORCE_COLLECTION_RECREATE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_recreate && 'true') || vars.FORCE_COLLECTION_RECREATE || 'false' }}
+          # Destructive rebuild is opt-in PER RUN via the dispatch input ONLY —
+          # no repo-variable fallback, so scheduled and default manual runs are
+          # guaranteed additive.
+          FORCE_COLLECTION_RECREATE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_recreate && 'true') || 'false' }}
           EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
           EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
           MAX_SCRAPE_URLS: ${{ vars.MAX_SCRAPE_URLS || '' }}
