@@ -4,10 +4,56 @@
 // content, never duplicates rows, and never mis-stamps section metadata.
 // Touches nothing — no DB, no network. Run with: npx tsx scripts/validateChunking.ts
 import { createParentChildChunks, MAX_DOCUMENT_BYTES } from "./lib/utils/chunking.js";
-import { splitMarkdownAware, MAX_CHUNK_BYTES } from "./lib/utils/markdownChunker.js";
+import { splitMarkdownAware, MAX_CHUNK_BYTES, type Chunk } from "./lib/utils/markdownChunker.js";
 import { isLowValueContent } from "./lib/scrapers/contentFilter.js";
 
 type Failures = string[];
+
+// Codex finding 9: the byte-ceiling test used to allow "the wide row appears
+// SOMEWHERE" as a pass condition, which let total content loss of everything
+// but one fragment slip through. This shared helper replaces that carve-out
+// with a strict, NUMBERED-marker assertion any test can reuse: given
+// `markers` in the same order they appear in the source document and
+// `chunks` walked in emission order, it asserts
+//   (a) COUNT         — every marker appears in at least one chunk,
+//   (b) ORDER         — each marker's first occurrence never comes after a
+//                        later-in-document marker's first occurrence
+//                        (repeats from overlap are fine; only first
+//                        occurrence is checked),
+//   (c) NO DUPLICATE LOSS — every marker is checked independently, so a
+//                        duplicated marker elsewhere can never mask one that
+//                        was actually dropped.
+export const checkMarkerCoverage = (markers: string[], chunks: string[], label: string): Failures => {
+  const failures: Failures = [];
+  const firstSeenAtChunk = new Map<number, number>();
+  let lastEmittedMarkerIdx = -1;
+
+  chunks.forEach((chunk: string, chunkIdx: number) => {
+    const foundInChunk = markers
+      .map((marker: string, idx: number) => ({ idx, pos: chunk.indexOf(marker) }))
+      .filter((f: { idx: number; pos: number }) => f.pos !== -1)
+      .sort((a: { pos: number }, b: { pos: number }) => a.pos - b.pos);
+
+    for (const { idx } of foundInChunk) {
+      if (firstSeenAtChunk.has(idx)) continue;
+      firstSeenAtChunk.set(idx, chunkIdx);
+      if (idx < lastEmittedMarkerIdx) {
+        failures.push(
+          `${label}: marker "${markers[idx]}" first appears after marker "${markers[lastEmittedMarkerIdx]}" — out of document order`,
+        );
+      }
+      lastEmittedMarkerIdx = Math.max(lastEmittedMarkerIdx, idx);
+    }
+  });
+
+  for (let i = 0; i < markers.length; i++) {
+    if (!firstSeenAtChunk.has(i)) {
+      failures.push(`${label}: marker "${markers[i]}" missing from every chunk — content lost`);
+    }
+  }
+
+  return failures;
+};
 
 const TEAMS = [
   "Arsenal", "Man City", "Liverpool", "Chelsea", "Newcastle",
@@ -321,11 +367,25 @@ const runAdjacentTablesTest = async (): Promise<Failures> => {
 // multi-byte glyphs (·, −, é, ö, –). A pathologically wide table row (e.g. a
 // stray long note or URL crammed into one cell) must never produce a chunk
 // Astra would reject outright, since that would abort the entire seed run.
+// NUMBERED markers embedded inside the wide cell so the byte-ceiling test can
+// assert strict count+order content preservation instead of the old
+// "appears somewhere, truncation is allowed" carve-out (Codex finding 9).
+const WIDE_ROW_MARKER_COUNT = 30;
+const wideRowMarkers: string[] = Array.from(
+  { length: WIDE_ROW_MARKER_COUNT },
+  (_, i) => `WCELL-${String(i + 1).padStart(3, "0")}`,
+);
+
 const buildWideRowDoc = (): string => {
   const glyphs = "·−";
-  let wideCell = "";
-  while (wideCell.length < 20000) wideCell += glyphs;
-  wideCell = wideCell.slice(0, 20000);
+  const wideCell = wideRowMarkers
+    .map((tag: string) => {
+      let filler = "";
+      while (filler.length < 600) filler += glyphs;
+      filler = filler.slice(0, 600);
+      return `${tag}${filler}`;
+    })
+    .join("");
 
   return [
     "# Wide Row Test",
@@ -373,10 +433,14 @@ const runByteCeilingTest = async (): Promise<Failures> => {
     }
   });
 
-  // 3: the wide row's content must still appear somewhere — split across
-  // several chunks is fine (truncation is allowed), total loss is not — and
-  // every piece of it must still carry the table header.
-  const wideRowChunks = allChunks.filter((c) => c.includes("·") || c.includes("−"));
+  // 3: STRICT content preservation — every numbered marker in the wide cell
+  // must survive, in document order, with no total-loss carve-out (Codex
+  // finding 9: the old check only asserted the row appeared "somewhere",
+  // which let everything but one fragment be silently dropped).
+  failures.push(...checkMarkerCoverage(wideRowMarkers, allChunks, "byte-ceiling wide cell"));
+
+  // 4: every piece of the wide cell must still carry the table header.
+  const wideRowChunks = allChunks.filter((c) => wideRowMarkers.some((m: string) => c.includes(m)));
   if (wideRowChunks.length === 0) {
     failures.push("byte-ceiling: the wide row's content is completely absent from every chunk");
   }
@@ -389,10 +453,178 @@ const runByteCeilingTest = async (): Promise<Failures> => {
   return failures;
 };
 
+// Regression test for Codex blocker 2 (table raw-cut loop's guaranteed
+// forward-progress fix): a header line so large on its own (~7,900 bytes)
+// that it already exceeds MAX_CHUNK_BYTES BEFORE a single row is added. This
+// is exactly the shape that used to cause a zero-progress infinite loop
+// (re-prepending a header that eats the whole cut budget, recreating the
+// same input forever). Wrapped in a Promise.race timeout so a regression
+// hangs the test with a clear failure instead of hanging the process.
+const GIANT_HEADER_ROW_COUNT = 5;
+const giantHeaderRowMarkers: string[] = Array.from(
+  { length: GIANT_HEADER_ROW_COUNT },
+  (_, i) => `ROW-${String(i + 1).padStart(3, "0")}`,
+);
+
+const buildGiantHeaderTableDoc = (): string => {
+  const header = "| " + "H".repeat(7890) + " |"; // ~7,900 bytes — already over MAX_CHUNK_BYTES alone.
+  const separator = "|---|";
+  const glyphCycle = ["·", "−", "😀"];
+  const rows = giantHeaderRowMarkers.map((tag: string) => {
+    let filler = "";
+    let gi = 0;
+    while (filler.length < 3000) {
+      filler += glyphCycle[gi % glyphCycle.length];
+      gi += 1;
+    }
+    return `| ${tag} ${filler} |`;
+  });
+  return [header, separator, ...rows].join("\n");
+};
+
+const withTimeout = async <T>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: did not terminate within ${ms}ms (possible hang)`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer!);
+  }
+};
+
+const runGiantHeaderTableTest = async (): Promise<Failures> => {
+  const failures: Failures = [];
+  const input = buildGiantHeaderTableDoc();
+
+  let chunks: Chunk[];
+  try {
+    chunks = await withTimeout(
+      splitMarkdownAware(input, MAX_CHUNK_BYTES + 1000, 0),
+      30000,
+      "giant-header table",
+    );
+  } catch (err) {
+    failures.push(`giant-header table: ${(err as Error).message}`);
+    return failures;
+  }
+
+  console.log(`\n=== Giant-header table: ${chunks.length} chunk(s) ===`);
+  chunks.forEach((c: Chunk, idx: number) => console.log(`  [${idx}] bytes=${Buffer.byteLength(c.text, "utf8")}`));
+
+  const texts = chunks.map((c: Chunk) => c.text);
+
+  // Every chunk must fit the 8,000-byte Astra ceiling.
+  texts.forEach((text: string, idx: number) => {
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_DOCUMENT_BYTES) {
+      failures.push(`giant-header table: chunk ${idx} is ${bytes} bytes, exceeds the ${MAX_DOCUMENT_BYTES}-byte ceiling`);
+    }
+    if (Buffer.from(text, "utf8").toString("utf8") !== text) {
+      failures.push(`giant-header table: chunk ${idx} does not round-trip through UTF-8 — a multi-byte character was split`);
+    }
+    if (text.includes("�")) {
+      failures.push(`giant-header table: chunk ${idx} contains a U+FFFD replacement character`);
+    }
+  });
+
+  // Every row marker must survive, in order, with no total loss.
+  failures.push(...checkMarkerCoverage(giantHeaderRowMarkers, texts, "giant-header table"));
+
+  return failures;
+};
+
+// Regression test for Codex blocker 1 (split-not-truncate through
+// createParentChildChunks): engineer metadata (a long League value) so that
+// prefix + already-fitting chunk text together exceed MAX_DOCUMENT_BYTES,
+// with a unique tail marker in the final bytes of the source content. Proves
+// the old truncate-and-discard behaviour (Codex blocker 1) is gone: the tail
+// must survive into at least one parent AND one child record, every stored
+// content string must stay within the byte ceiling, and any resulting
+// multiple parent pieces must each keep a distinct, stable id.
+const OVERSIZED_TAIL_MARKER = "TAILMARK-9f21ab";
+
+const buildOversizedPrefixDoc = (): string => {
+  const leagueValue = "L".repeat(2500);
+  // Stats keywords + numbers throughout so isLowValueContent (which is lenient
+  // for stats-shaped text at any length >= 100 chars) doesn't filter out the
+  // short tail fragment the split produces — that fragment is what carries
+  // the tail marker into a child record.
+  let filler = "";
+  while (filler.length < 3450) {
+    filler += "team scored 42 goals with 10 assists in the match, ranking table points and league standings. ";
+  }
+  return [
+    "# Oversized Prefix Test",
+    "",
+    `> **Type:** Padding Test  |  **League:** ${leagueValue}  |  **Season:** 2025/26`,
+    "",
+    `${filler} ${OVERSIZED_TAIL_MARKER}`,
+  ].join("\n");
+};
+
+const runOversizedPrefixChildTest = async (): Promise<Failures> => {
+  const failures: Failures = [];
+  const doc = buildOversizedPrefixDoc();
+  const sizes = { parentMaxSize: 10000, parentOverlap: 0, childMaxSize: 10000, childOverlap: 0 };
+
+  const result = await createParentChildChunks(
+    doc, sizes, "Oversized Prefix Test", "https://test.com", "stats", isLowValueContent,
+  );
+
+  if (!result) {
+    failures.push("oversized-prefix-child: createParentChildChunks returned null — no chunks produced at all");
+    return failures;
+  }
+
+  const { parentDocs, childTexts } = result;
+  console.log(`\n=== Oversized prefix/child: parents=${parentDocs.length} children=${childTexts.length} ===`);
+
+  // Every stored content string (parent AND child, prefix included) must fit
+  // the 8,000-byte Astra ceiling.
+  parentDocs.forEach((p, idx) => {
+    const bytes = Buffer.byteLength(p.content, "utf8");
+    if (bytes > MAX_DOCUMENT_BYTES) {
+      failures.push(`oversized-prefix-child: parent ${idx} is ${bytes} bytes, exceeds the ${MAX_DOCUMENT_BYTES}-byte ceiling`);
+    }
+  });
+  childTexts.forEach((text: string, idx: number) => {
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_DOCUMENT_BYTES) {
+      failures.push(`oversized-prefix-child: child ${idx} is ${bytes} bytes, exceeds the ${MAX_DOCUMENT_BYTES}-byte ceiling`);
+    }
+  });
+
+  // The tail marker must survive — split-not-truncate, not truncate-and-discard.
+  if (!parentDocs.some((p) => p.content.includes(OVERSIZED_TAIL_MARKER))) {
+    failures.push(`oversized-prefix-child: tail marker "${OVERSIZED_TAIL_MARKER}" missing from every parent — content lost`);
+  }
+  if (!childTexts.some((c: string) => c.includes(OVERSIZED_TAIL_MARKER))) {
+    failures.push(`oversized-prefix-child: tail marker "${OVERSIZED_TAIL_MARKER}" missing from every child — content lost`);
+  }
+
+  // If the split produced multiple parents, every id must be unique.
+  if (parentDocs.length > 1) {
+    const idSet = new Set(parentDocs.map((p) => p._id));
+    if (idSet.size !== parentDocs.length) {
+      failures.push(
+        `oversized-prefix-child: expected ${parentDocs.length} unique parent ids, got ${idSet.size} distinct values`,
+      );
+    }
+  } else {
+    failures.push(
+      "oversized-prefix-child: expected the oversized prefix+text combo to produce multiple parent pieces, got 1 — the overflow scenario was not exercised",
+    );
+  }
+
+  return failures;
+};
+
 const runEmojiTest = async (): Promise<Failures> => {
   const failures: Failures = [];
   const REPLACEMENT_CHAR = "\uFFFD";
-  
+
   // Test with overlap = 0 first (the bug case)
   const input = "a".repeat(399) + "\u{1F600}" + " tail text";
   const chunksZeroOverlap = await splitMarkdownAware(input, 400, 0);
@@ -586,7 +818,7 @@ const runRowCoverageTest = async (): Promise<Failures> => {
 const runContentPreservationTest = async (): Promise<Failures> => {
   const failures: Failures = [];
   const REPLACEMENT_CHAR = "\uFFFD";
-  
+
   // Mixed document with prose + table + heading + multi-byte characters
   const mixedDoc = [
     "# Test Document · 2025/26",
@@ -672,6 +904,8 @@ const main = async () => {
   allFailures.push(...(await runHeadingOnlyTest()).map((f: string) => `[heading-only] ${f}`));
   allFailures.push(...(await runAdjacentTablesTest()).map((f: string) => `[adjacent-tables] ${f}`));
   allFailures.push(...(await runByteCeilingTest()).map((f: string) => `[byte-ceiling] ${f}`));
+  allFailures.push(...(await runGiantHeaderTableTest()).map((f: string) => `[giant-header-table] ${f}`));
+  allFailures.push(...(await runOversizedPrefixChildTest()).map((f: string) => `[oversized-prefix-child] ${f}`));
   allFailures.push(...(await runEmojiTest()).map((f: string) => `[emoji] ${f}`));
   allFailures.push(...(await runContentPreservationTest()).map((f: string) => `[content-preservation] ${f}`));
   allFailures.push(...(await runProseMultiSectionTest()).map((f: string) => `[prose-multi-section] ${f}`));
