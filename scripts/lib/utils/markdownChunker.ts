@@ -355,37 +355,37 @@ const splitProseBlock = async (text: string, maxSize: number, overlap: number): 
   if (!trimmed) return [];
   const splitter = new RecursiveCharacterTextSplitter({ chunkSize: maxSize, chunkOverlap: overlap });
   const pieces = await splitter.splitText(trimmed);
-  const repaired = pieces.map((p) => repairSurrogateBoundary(p).trim()).filter((p) => p.length > 0);
-  
-  // Check for content loss: if repairSurrogateBoundary removed characters,
-  // the remainder might be in the next piece. Try to recover it.
+  // Repair lone surrogates produced when the splitter cuts inside a surrogate
+  // pair. We iterate over `pieces` (not over the filtered repaired array) so
+  // that an i++ skip for a merged pair does not also skip the piece that
+  // follows the lone-surrogate piece — the bug that caused content loss at
+  // overlap=0 when the emoji landed exactly at a chunk boundary.
+  const repairedAll = pieces.map((p) => repairSurrogateBoundary(p).trim());
+
   const result: string[] = [];
-  for (let i = 0; i < repaired.length; i++) {
-    let piece = repaired[i];
+  for (let i = 0; i < pieces.length; i++) {
+    let piece = repairedAll[i];
     const originalPiece = pieces[i];
-    
-    // If the repaired piece is shorter than the original, and the next piece
-    // starts with a lone low surrogate, they were likely split in the middle
-    // of a surrogate pair. Rejoin them.
-    if (piece.length < originalPiece.length && i < repaired.length - 1) {
+
+    // If the repaired piece is shorter than the original and the very next
+    // raw piece starts with a lone low surrogate, the splitter cut inside a
+    // surrogate pair — rejoin the two halves using the originals.
+    if (piece.length < originalPiece.length && i < pieces.length - 1) {
       const nextPieceStart = pieces[i + 1].slice(0, 1);
       const nextCode = nextPieceStart.charCodeAt(0);
-      // Check if next piece starts with a lone low surrogate (0xDC00-0xDFFF)
       if (nextCode >= 0xdc00 && nextCode <= 0xdfff) {
         const originalEnd = originalPiece.slice(-1);
         const endCode = originalEnd.charCodeAt(0);
-        // Check if original piece ended with a lone high surrogate (0xD800-0xDBFF)
         if (endCode >= 0xd800 && endCode <= 0xdbff) {
-          // Rejoin the surrogate pair
           piece = (originalPiece + pieces[i + 1]).trim();
-          // Skip the next piece since we merged it
-          i++;
+          i++; // consume the lone low-surrogate piece
         }
       }
     }
-    result.push(piece);
+
+    if (piece.length > 0) result.push(piece);
   }
-  
+
   return result;
 };
 
@@ -396,21 +396,49 @@ const splitProseBlock = async (text: string, maxSize: number, overlap: number): 
 // Callers MUST handle the remainder to avoid content loss.
 export const utf8SafeCut = (s: string, maxBytes: number): { cut: string; remainder: string } => {
   if (byteLen(s) <= maxBytes) return { cut: s, remainder: "" };
-  const chars = Array.from(s); // Split into code points
-  let out = "";
+  const chars = Array.from(s); // Split into code points (never splits a surrogate pair)
   let bytes = 0;
-  for (const ch of chars) {
-    const b = byteLen(ch);
+  for (let i = 0; i < chars.length; i++) {
+    const b = byteLen(chars[i]);
     if (bytes + b > maxBytes) {
-      // Return the remainder starting from this character
-      const idx = chars.indexOf(ch);
-      const remainder = chars.slice(idx).join("");
-      return { cut: out, remainder };
+      // Use the current index `i`, not chars.indexOf(), which would return
+      // the first occurrence and produce a wrong (oversized) remainder for
+      // strings that contain repeated characters.
+      return {
+        cut: chars.slice(0, i).join(""),
+        remainder: chars.slice(i).join(""),
+      };
     }
-    out += ch;
     bytes += b;
   }
-  return { cut: out, remainder: "" };
+  return { cut: s, remainder: "" };
+};
+
+// Finds the leading table in `text` (after any heading or blank lines) and
+// returns its header, optional separator, and data rows. Returns null when
+// the text doesn't start with a recognisable table (at least one data row).
+// Used by the ceiling loop to re-split oversized table chunks table-aware.
+const extractLeadingTable = (
+  text: string,
+): { header: string; separator: string | null; rows: string[] } | null => {
+  const ls = text.split("\n");
+  let ti = 0;
+  while (ti < ls.length && !TABLE_ROW_RE.test(ls[ti])) ti++;
+  if (ti >= ls.length) return null;
+  const hdr = ls[ti];
+  let tj = ti + 1;
+  let sep: string | null = null;
+  if (tj < ls.length && TABLE_SEP_RE.test(ls[tj])) {
+    sep = ls[tj];
+    tj++;
+  }
+  const tableRows: string[] = [];
+  while (tj < ls.length && TABLE_ROW_RE.test(ls[tj]) && ls[tj].trim().length > 0) {
+    tableRows.push(ls[tj]);
+    tj++;
+  }
+  if (tableRows.length === 0) return null;
+  return { header: hdr, separator: sep, rows: tableRows };
 };
 
 export const splitMarkdownAware = async (
@@ -425,7 +453,6 @@ export const splitMarkdownAware = async (
 
   const sections = splitIntoSections(content);
   const chunks: Chunk[] = [];
-  let pendingText: string = ""; // Characters that were cut off from previous chunks
 
   for (const section of sections) {
     const blocks = parseSectionBlocks(section);
@@ -445,28 +472,91 @@ export const splitMarkdownAware = async (
     }
   }
 
-  // Last-line defence: no chunk leaving this module may exceed MAX_CHUNK_BYTES,
-  // regardless of which path (table packing, prose splitting, heading
-  // attachment) produced it. A chunk that cannot fit is cut, never dropped.
-  // If a chunk is cut, the remainder is prepended to the next chunk to prevent loss.
+  // ── Last-line defence ──────────────────────────────────────────────────────
+  // No chunk leaving this function may exceed MAX_CHUNK_BYTES, regardless of
+  // which path (table packing, prose splitting, heading attachment) produced it.
+  //
+  // • Table chunks that are oversized are re-split with packTableRows so the
+  //   table header is repeated on every continuation piece. When a single row
+  //   plus its header still exceeds the ceiling (e.g. a 50 KB cell value) we
+  //   fall back to raw byte cutting while prepending the header to every piece
+  //   whose header fits within the budget.
+  //
+  // • Non-table (prose) chunks are drained with a while loop.
+  //
+  // Content is NEVER dropped — cutting is a last resort, trimming is only for
+  // cosmetic whitespace at the edges.
   const processedChunks: Chunk[] = [];
-  for (const c of chunks) {
-    const fullText = pendingText + c.text;
-    const { cut, remainder } = utf8SafeCut(fullText, MAX_CHUNK_BYTES);
-    const trimmed = cut.trim();
-    if (trimmed.length > 0) {
-      processedChunks.push({ text: trimmed, meta: c.meta });
-    }
-    pendingText = remainder;
-  }
 
-  // If there's still pending text after processing all chunks, add it as a final chunk
-  // (this handles the case where content overflowed the last chunk)
-  if (pendingText.trim().length > 0 && processedChunks.length > 0) {
-    processedChunks.push({
-      text: pendingText.trim(),
-      meta: processedChunks[processedChunks.length - 1].meta,
-    });
+  for (const c of chunks) {
+    const fullText = c.text;
+
+    // Fast path: chunk already fits.
+    if (byteLen(fullText) <= MAX_CHUNK_BYTES) {
+      const trimmed = fullText.trim();
+      if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
+      continue;
+    }
+
+    // Slow path: chunk exceeds the ceiling.
+    const tbl = extractLeadingTable(fullText);
+
+    if (tbl !== null) {
+      // ── Table-aware split ──────────────────────────────────────────────
+      // Re-split using packTableRows (which always emits the header on every
+      // piece). This handles multi-row tables; single oversized rows fall to
+      // the raw-cut branch below.
+      const { header, separator, rows } = tbl;
+      const headLines = separator !== null ? [header, separator] : [header];
+      const headPrefix = headLines.join("\n") + "\n";
+      const headPrefixBytes = byteLen(headPrefix);
+      // Only prepend the header on continuation pieces when the header itself
+      // fits within the budget (an 8 KB header cannot be its own solution).
+      const canAddHeader = headPrefixBytes < MAX_CHUNK_BYTES;
+
+      const tPieces = packTableRows(null, header, separator, rows, MAX_CHUNK_BYTES);
+      for (const tPiece of tPieces) {
+        if (byteLen(tPiece) <= MAX_CHUNK_BYTES) {
+          const trimmed = tPiece.trim();
+          if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
+          continue;
+        }
+
+        // Single row (+ header) still exceeds ceiling — raw-cut in a loop.
+        // The first cut naturally includes the header because tPiece starts
+        // with it. On every subsequent cut we re-prepend the header so that
+        // each piece retains its table context.
+        let rem = tPiece;
+        while (rem.length > 0) {
+          if (byteLen(rem) <= MAX_CHUNK_BYTES) {
+            const trimmed = rem.trim();
+            if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
+            break;
+          }
+          const { cut, remainder } = utf8SafeCut(rem, MAX_CHUNK_BYTES);
+          const trimmed = cut.trim();
+          if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
+          if (remainder.length === 0) break;
+          rem = canAddHeader ? headPrefix + remainder : remainder;
+        }
+      }
+    } else {
+      // ── Non-table (prose) ─────────────────────────────────────────────
+      // Drain the chunk with a while loop. Each iteration emits one capped
+      // piece; the loop continues until nothing remains.
+      let rem = fullText;
+      while (rem.length > 0) {
+        if (byteLen(rem) <= MAX_CHUNK_BYTES) {
+          const trimmed = rem.trim();
+          if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
+          break;
+        }
+        const { cut, remainder } = utf8SafeCut(rem, MAX_CHUNK_BYTES);
+        const trimmed = cut.trim();
+        if (trimmed.length > 0) processedChunks.push({ text: trimmed, meta: c.meta });
+        rem = remainder;
+      }
+    }
   }
 
   return processedChunks;
