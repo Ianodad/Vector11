@@ -50,3 +50,10 @@ The branch's API improvements (season semantics, hybrid retrieval, cold-start
 handling) ship only when `fix/retrieval-season-hybrid` merges to main and prod
 redeploys. Merge is NOT done — per standing rule, no merge to main without
 explicit user instruction.
+
+## CLOSED — 2026-07-30 ~17:40 EAT
+Branch merged to main (b824f83, explicit user instruction) and deployed:
+Vercel deployment 5676723553 success, prod smoke green. New API code verified
+live — season semantics now correctly frame 2025-26 as the completed latest
+season. No open flags remain except the accepted risks listed above and the
+scraper-source replacement backlog (.planning/research-sources.md).
