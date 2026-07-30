@@ -13,6 +13,11 @@ export interface InsertResult {
 // 2-hour seed run — it gets logged and skipped instead.
 const SIZE_LIMIT_RE = /document size limitation|exceeds maximum allowed/i;
 
+// Matches transient Astra/Cassandra errors that are safe to retry.
+const TRANSIENT_RE = /timeout|timed out|replica|unavailable|NullPointer|server error/i;
+
+const MAX_RETRY_ATTEMPTS = 6;
+
 const isOversized = (doc: { content: string; $lexical?: string }): boolean =>
   Buffer.byteLength(doc.content, "utf8") > MAX_DOCUMENT_BYTES ||
   (doc.$lexical !== undefined && Buffer.byteLength(doc.$lexical, "utf8") > MAX_DOCUMENT_BYTES);
@@ -23,6 +28,47 @@ const isOversized = (doc: { content: string; $lexical?: string }): boolean =>
 // of inferring it from which documents we think should have succeeded.
 const insertedCountOf = (err: unknown): number =>
   err instanceof CollectionInsertManyError ? err.insertedIds().length : 0;
+
+// Wraps a single insertMany call with retry on transient Astra/Cassandra errors.
+// Duplicate and size-limit errors are NOT retried — they propagate immediately so
+// the existing handling in batchInsertParents / batchInsertChildren is unchanged.
+const insertManyWithRetry = async (
+  doInsert: () => Promise<{ insertedCount: number }>,
+  batchIdx: number,
+): Promise<{ insertedCount: number }> => {
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await doInsert();
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "";
+      // Duplicate and size-limit are not transient — propagate for existing handling
+      if (
+        msg.includes("already exists") ||
+        msg.includes("duplicate") ||
+        SIZE_LIMIT_RE.test(msg)
+      ) {
+        throw err;
+      }
+      // Non-transient unknown error — propagate immediately
+      if (!TRANSIENT_RE.test(msg)) {
+        throw err;
+      }
+      // Transient — retry if attempts remain, otherwise propagate
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        const delay = attempt * 10_000;
+        console.log(
+          `  [Retry] Batch ${batchIdx} attempt ${attempt}/${MAX_RETRY_ATTEMPTS} failed (transient), ` +
+            `retrying in ${delay / 1000}s — ${msg.slice(0, 120)}`,
+        );
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+  // Unreachable — loop always returns or throws
+  throw new Error("insertManyWithRetry: unreachable");
+};
 
 export const batchInsertParents = async (
   collection: Collection,
@@ -35,7 +81,10 @@ export const batchInsertParents = async (
   for (let b = 0; b < parentDocs.length; b += INSERT_BATCH) {
     const batch = parentDocs.slice(b, b + INSERT_BATCH);
     try {
-      const res = await collection.insertMany(batch, { ordered: false });
+      const res = await insertManyWithRetry(
+        () => collection.insertMany(batch, { ordered: false }),
+        b / INSERT_BATCH,
+      );
       recordsAdded += res.insertedCount;
     } catch (insertErr: unknown) {
       const msg = insertErr instanceof Error ? insertErr.message : "";
@@ -106,7 +155,10 @@ export const batchInsertChildren = async (
       });
 
     try {
-      const res = await collection.insertMany(batchDocs, { ordered: false });
+      const res = await insertManyWithRetry(
+        () => collection.insertMany(batchDocs, { ordered: false }),
+        b / INSERT_BATCH,
+      );
       recordsAdded += res.insertedCount;
     } catch (insertErr: unknown) {
       const msg = insertErr instanceof Error ? insertErr.message : "";
