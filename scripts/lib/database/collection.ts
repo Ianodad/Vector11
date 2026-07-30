@@ -48,8 +48,18 @@ const pollForCollection = async (
 ): Promise<boolean> => {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const defs = await listCollectionDefinitions(db);
-    if (defs.some((c) => c.name === collectionName)) return true;
+    try {
+      const defs = await listCollectionDefinitions(db);
+      if (defs.some((c) => c.name === collectionName)) return true;
+    } catch (err) {
+      // The DB is flakiest right after a create timeout — exactly when this
+      // poll runs. A thrown list call here must not abort the whole
+      // create-retry loop; treat it as "collection not visible yet" and keep
+      // polling until the deadline.
+      console.warn(
+        `[db] listCollections failed while polling for '${collectionName}': ${getErrorMessage(err)}`,
+      );
+    }
     if (Date.now() >= deadline) return false;
     await sleepMs(intervalMs);
   }

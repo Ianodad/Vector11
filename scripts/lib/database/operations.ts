@@ -6,6 +6,7 @@ import { MAX_DOCUMENT_BYTES, type ParentRecord, type ChildRecord } from "../util
 export interface InsertResult {
   recordsAdded: number;
   recordsSkipped: number;
+  recordsDuplicated: number;
 }
 
 // Matches Astra's rejection message for an indexed field (content/$lexical)
@@ -77,6 +78,7 @@ export const batchInsertParents = async (
   const INSERT_BATCH = 20;
   let recordsAdded = 0;
   let recordsSkipped = 0;
+  let recordsDuplicated = 0;
 
   for (let b = 0; b < parentDocs.length; b += INSERT_BATCH) {
     const batch = parentDocs.slice(b, b + INSERT_BATCH);
@@ -91,6 +93,7 @@ export const batchInsertParents = async (
       const inserted = insertedCountOf(insertErr);
       if (msg.includes("already exists") || msg.includes("duplicate")) {
         recordsAdded += inserted;
+        recordsDuplicated += Math.max(0, batch.length - inserted);
         console.log(
           `  Parent batch had duplicates, inserted ${inserted} new docs`,
         );
@@ -109,13 +112,14 @@ export const batchInsertParents = async (
         }
         recordsSkipped += oversized.length;
         recordsAdded += inserted;
+        recordsDuplicated += Math.max(0, batch.length - inserted - oversized.length);
       } else {
         throw insertErr;
       }
     }
   }
 
-  return { recordsAdded, recordsSkipped };
+  return { recordsAdded, recordsSkipped, recordsDuplicated };
 };
 
 export const batchInsertChildren = async (
@@ -131,6 +135,7 @@ export const batchInsertChildren = async (
   const INSERT_BATCH = 20;
   let recordsAdded = 0;
   let recordsSkipped = 0;
+  let recordsDuplicated = 0;
 
   for (let b = 0; b < childTexts.length; b += INSERT_BATCH) {
     const batchDocs: ChildRecord[] = childTexts
@@ -165,6 +170,7 @@ export const batchInsertChildren = async (
       const inserted = insertedCountOf(insertErr);
       if (msg.includes("already exists") || msg.includes("duplicate")) {
         recordsAdded += inserted;
+        recordsDuplicated += Math.max(0, batchDocs.length - inserted);
         console.log(
           `  Child batch had duplicates, inserted ${inserted} new docs`,
         );
@@ -180,11 +186,12 @@ export const batchInsertChildren = async (
         }
         recordsSkipped += oversized.length;
         recordsAdded += inserted;
+        recordsDuplicated += Math.max(0, batchDocs.length - inserted - oversized.length);
       } else {
         throw insertErr;
       }
     }
   }
 
-  return { recordsAdded, recordsSkipped };
+  return { recordsAdded, recordsSkipped, recordsDuplicated };
 };

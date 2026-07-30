@@ -64,6 +64,7 @@ const processDataSources = async (
   parentsAdded: number;
   childrenAdded: number;
   recordsSkipped: number;
+  recordsDuplicated: number;
   totalEmbeddingTokens: number;
   skippedUrls: number;
   failedUrls: number;
@@ -78,6 +79,7 @@ const processDataSources = async (
   let parentsAdded = 0;
   let childrenAdded = 0;
   let recordsSkipped = 0;
+  let recordsDuplicated = 0;
   let totalEmbeddingTokens = 0;
   const urlChunkStats: Record<string, { parents: number; children: number }> = {};
   const processedUrlList: string[] = [];
@@ -283,6 +285,7 @@ const processDataSources = async (
       recordsAdded += parentResult.recordsAdded;
       parentsAdded += parentResult.recordsAdded;
       recordsSkipped += parentResult.recordsSkipped;
+      recordsDuplicated += parentResult.recordsDuplicated;
 
       // Insert child docs
       const scrapedAt = new Date().toISOString();
@@ -299,6 +302,7 @@ const processDataSources = async (
       recordsAdded += childResult.recordsAdded;
       childrenAdded += childResult.recordsAdded;
       recordsSkipped += childResult.recordsSkipped;
+      recordsDuplicated += childResult.recordsDuplicated;
 
       // Track per-URL chunk counts for the summary
       urlChunkStats[url] = {
@@ -333,6 +337,7 @@ const processDataSources = async (
     parentsAdded,
     childrenAdded,
     recordsSkipped,
+    recordsDuplicated,
     totalEmbeddingTokens,
     skippedUrls,
     failedUrls,
@@ -426,6 +431,7 @@ const seed = async () => {
     parentsAdded,
     childrenAdded,
     recordsSkipped,
+    recordsDuplicated,
     totalEmbeddingTokens,
     skippedUrls,
     failedUrls,
@@ -438,6 +444,7 @@ const seed = async () => {
   // exceeding its 8,000-byte indexed field limit was logged per-document above
   // and is summed here as one unmissable end-of-run total.
   console.log(`\nSkipped ${recordsSkipped} oversized documents`);
+  console.log(`Duplicated ${recordsDuplicated} documents (same content-hash _id, tolerated by design)`);
   console.log(`Skipped URLs: ${skippedUrls} | Failed URLs: ${failedUrls}`);
 
   // The in-place, non-atomic rebuild (no transactional guarantee across the
@@ -451,11 +458,11 @@ const seed = async () => {
     process.exitCode = 1;
   }
 
-  const expectedRecordsAdded = attemptedRecords - recordsSkipped;
+  const expectedRecordsAdded = attemptedRecords - recordsSkipped - recordsDuplicated;
   if (recordsAdded !== expectedRecordsAdded) {
     console.warn(
       `\n⚠️  Record count mismatch: recordsAdded=${recordsAdded} but expected ${expectedRecordsAdded} ` +
-        `(attempted=${attemptedRecords} - oversizedSkipped=${recordsSkipped}). This indicates a silent partial insert.`,
+        `(attempted=${attemptedRecords} - oversizedSkipped=${recordsSkipped} - duplicated=${recordsDuplicated}). This indicates a silent partial insert.`,
     );
     process.exitCode = 1;
   }
