@@ -1,9 +1,91 @@
 # Handoff — Fable 5 — vector11 / retrieval + season + chunking fix
 
-**Date:** 2026-07-30, ~11:30 EAT (supersedes 2026-07-29 handoff)
+**Date:** 2026-07-30, ~12:15 EAT (LIVE — updated mid-session at each checkpoint)
 **Branch:** `fix/retrieval-season-hybrid` (branched from `main`, never merged, no push)
-**Last code commit:** `8f05ab1` — seed insert transient retry
-**Verdict of record:** Codex xhigh pre-re-seed review = **NO-GO** (5 BLOCKER / 3 MAJOR / 1 MINOR)
+**Last code commit:** `f7f5966` — lifecycle safety (blockers 3-5); `257f589` — chunker (blockers 1-2)
+**Verdict of record:** Codex NO-GO of 2026-07-29 being remediated; re-review pending after round 2
+
+## SESSION UPDATE 2026-07-30 (this session, decision: user approved "A then B")
+
+- **OPTION A DONE + VERIFIED.** Local network has a Fortinet firewall BLOCKING
+  all of *.vercel.com and *.vercel.app (403 block page, cert MITM) — `vercel --prod`
+  impossible from this machine. Shipped instead via empty commit to `main`
+  (679a722 — zero code change; main HEAD was exactly the last deployed sha
+  a7a00cc) → Vercel Git integration rebuilt prod with EMBEDDING_DIMENSIONS=1536.
+  Verified from a GitHub runner via new workflow `.github/workflows/prod-smoke.yml`
+  (commit 9178e91 on main, `gh workflow run prod-smoke.yml`): live /api/chat
+  returns full standings table (Liverpool 84 pts …). Prod vector search UNBROKEN.
+- **Blockers 1–2 fixed** (commit 257f589): table raw-cut loop now provably
+  terminating (MIN_ROW_CONTENT_BUDGET_BYTES=64 + forward-progress guard);
+  chunking.ts split-not-truncate (`splitOversizedText` + `capPrefix`, ≥1024-byte
+  chunk budget; `enforceDocByteLimit` now THROWS as backstop, never discards).
+  Verified: repro hang cases terminate in ms, marker survives, ≤8000 bytes.
+- **Blockers 3–4 fixed + 5 mitigated** (commit f7f5966): `dropCollectionVerified`
+  (listCollections-verified, 5 retries, throws on survivor);
+  `createCollectionWithRetry` (4 attempts, 60s materialization poll, full-config
+  post-verify dimension+metric+lexical+rerank, one recreate cycle max);
+  loadDb summary now returns failedUrls/skippedUrls/attemptedRecords, exitCode 1
+  on failures or count mismatch, final exit respects exitCode.
+- Gates re-run by orchestrator on combined tree: validator exit 0, tsc clean,
+  eslint 0 errors. Two commits made by orchestrator (agents forbidden from git).
+- **IN FLIGHT (round 2, two parallel sonnet executors):**
+  (a) validator strengthening per finding 9 — spec `.planning/task-validator-strengthen.md`;
+  (b) follow-ups — duplicate-aware count assertion (operations.ts InsertResult
+  gains recordsDuplicated; expectation = attempted − skipped − duplicated) and
+  pollForCollection tolerating throwing listCollections — spec
+  `.planning/task-lifecycle-followups.md`.
+- **Round 2 COMPLETE + committed** (7a36871 validator, e9bf686 follow-ups).
+  Gates green. **Accuracy gate re-run: 4/4 PASS** (temp collection seeded
+  through the NEW lifecycle+chunker code — live smoke of the fixed paths;
+  200 parents/596 children, max chunk 1,583 bytes, temp dropped clean).
+- **Codex round-2 re-review: NO-GO again, but narrow** (full text
+  `scratchpad/codex-round2.log`): blockers 1–4 confirmed substantially fixed,
+  MAJORs 6–7 ruled accepted risks. 3 actionable: (1) BLOCKER — workflow never
+  guaranteed FORCE_COLLECTION_RECREATE; (2) MAJOR — capped/uncapped prefix
+  disagreement in splitOversizedText vs enforceDocByteLimit → reproducible
+  throw aborts seed; (3) MINOR — giant-header timeout can't catch sync hang.
+- **All 3 fixed + committed**: 363c256 (cap-first fit check, warn dedup;
+  subprocess-isolated giant-header probe `__giantHeaderProbe.ts`, spawnSync
+  30s SIGKILL) and 7e07953 (update-db.yml workflow_dispatch boolean input
+  `force_recreate`; scheduled runs stay additive). Gates re-run green;
+  executor's live repro of the old finding-2 scenario now passes.
+- **Codex round-3: VERDICT GO** (`scratchpad/codex-round3.log`). All 3
+  round-2 findings resolved; 1 new non-blocking MAJOR (expression fallback to
+  repo var) fixed immediately per Codex's exact suggestion (dc38f1a).
+- **RE-SEED DISPATCHED AND RUNNING**: branch pushed to origin; run
+  30529868065 (`update-db.yml` on fix/retrieval-season-hybrid,
+  force_recreate=true), started ~12:47 EAT, ETA ~2h. Empirically confirmed
+  destructive path engaged: live collection vector11gpt at 0 docs with fresh
+  VERIFIED config (dim 1536, dot_product, lexical+rerank enabled). Prod
+  retrieval degraded during rebuild (accepted).
+- **INCIDENT (~15:00 EAT): first re-seed produced a BROKEN collection.**
+  Run 30529868065's createCollection hit the PT30S transient failure,
+  collection materialized server-side with definition intact but FIELD
+  INDEXES missing — invisible to our definition verification. All filtered
+  queries (type/category/parentId) failed CORRUPTED_COLLECTION_SCHEMA →
+  BOTH app retrieval paths (hybrid + vector fallback filter on type:"child")
+  broken → prod smoke FAILED ("no retrieved context"). Astra: unrepairable,
+  recreate only. Cancelled the run (collection unusable, data disposable).
+- **Fix shipped (b4db0e3, pushed): `probeFieldIndexes` canary** — after
+  definition verify passes, findOne({type:"__index_probe__"}); missing-index
+  error shapes → config mismatch → existing recreate-once flow; other errors
+  retry 3×5s then THROW (never seed into unverifiable collection).
+  **Live-verified against the actual broken collection: correctly rejected**
+  (by then replicas were failing LOCAL_QUORUM reads — even deeper breakage).
+- **SEED ATTEMPT 2 RUNNING: run 30540848893** (branch, force_recreate=true,
+  dispatched ~15:35 EAT, ETA ~17:45). Codex delta review of b4db0e3 running
+  in parallel (`scratchpad/codex-round4.log`) — if it finds a material
+  defect, cancel the run and remediate.
+- **REMAINING after run completes:** run conclusion + logs (expect verified
+  drop, clean create, PROBE PASS, failedUrls/duplicated counts, exit 0) →
+  filtered-query probe on live collection (`_idxprobe.mts`) → prod smoke
+  re-run → synthesis + Fable completion decision → prod redeploy of BRANCH
+  code stays a user decision. Helpers (untracked): `_checkdb.mts` (count/
+  config), `_idxprobe.mts` (filter health), `_probetest.ts` (createCollection
+  guard), `_insertprobe.mts`.
+- Design decision logged: blocker 5 gets the cheap rails, NOT the staging-
+  collection atomic redesign. MAJORs 6–7 + finding 8 remain open (out of B's
+  scope per handoff; disclose to Codex re-review).
 
 ---
 
