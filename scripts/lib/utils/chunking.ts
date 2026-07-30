@@ -75,6 +75,13 @@ const prependPrefix = (text: string, prefix: string): string => {
 // also what guarantees the split loop below terminates for any input.
 const MIN_CHUNK_BUDGET_BYTES = 1024;
 
+// capPrefix is now called on every splitOversizedText invocation (see below)
+// as well as from enforceDocByteLimit, so a pathological prefix would warn
+// once per parent/child piece of the same doc. Dedupe on source+url so a
+// single doc only ever logs the warning once, no matter how many pieces it
+// produces.
+const warnedPrefixSources = new Set<string>();
+
 // Caps `prefix` when it alone would leave less than MIN_CHUNK_BUDGET_BYTES of
 // room within MAX_DOCUMENT_BYTES. Metadata tail loss here is acceptable (and
 // logged loudly); chunk content loss is not. Pure/deterministic so callers
@@ -83,9 +90,13 @@ const MIN_CHUNK_BUDGET_BYTES = 1024;
 const capPrefix = (prefix: string, source: string, url: string): string => {
   const maxPrefixBytes = MAX_DOCUMENT_BYTES - MIN_CHUNK_BUDGET_BYTES;
   if (Buffer.byteLength(prefix, "utf8") <= maxPrefixBytes) return prefix;
-  console.warn(
-    `[chunking] prefix exceeded ${maxPrefixBytes}-byte budget, truncated (metadata tail lost, not chunk content). source="${source}" url="${url}"`,
-  );
+  const warnKey = `${source}|${url}`;
+  if (!warnedPrefixSources.has(warnKey)) {
+    warnedPrefixSources.add(warnKey);
+    console.warn(
+      `[chunking] prefix exceeded ${maxPrefixBytes}-byte budget, truncated (metadata tail lost, not chunk content). source="${source}" url="${url}"`,
+    );
+  }
   return utf8SafeCut(prefix, maxPrefixBytes).cut;
 };
 
@@ -112,11 +123,21 @@ const enforceDocByteLimit = (prefix: string, chunk: string, source: string, url:
 // dropped. Returns `[text]` unchanged in the overwhelming common case, since
 // splitMarkdownAware already caps chunks well under this ceiling before the
 // prefix is added.
+//
+// The fit check below MUST use the same capped prefix that
+// enforceDocByteLimit will use later for this same piece. Using the
+// UNCAPPED prefix here (as before) can make prependPrefix's first-line dedup
+// disagree between this function and enforceDocByteLimit — capPrefix's
+// byte-cut can change the prefix's first line, so a `text` that dedups
+// against the raw prefix may NOT dedup against the capped one, letting a
+// piece pass this "does it fit?" check unsplit and then blow past
+// MAX_DOCUMENT_BYTES (and throw) in enforceDocByteLimit. Capping first here
+// makes both functions agree on the exact same prefix string.
 const splitOversizedText = (prefix: string, text: string, source: string, url: string): string[] => {
-  const full = prependPrefix(text, prefix);
+  const usablePrefix = capPrefix(prefix, source, url);
+  const full = prependPrefix(text, usablePrefix);
   if (Buffer.byteLength(full, "utf8") <= MAX_DOCUMENT_BYTES) return [text];
 
-  const usablePrefix = capPrefix(prefix, source, url);
   const budget = MAX_DOCUMENT_BYTES - Buffer.byteLength(usablePrefix, "utf8");
 
   const pieces: string[] = [];

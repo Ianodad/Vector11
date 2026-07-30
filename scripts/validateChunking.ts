@@ -3,9 +3,14 @@
 // separates table rows from their header/season context, never drops
 // content, never duplicates rows, and never mis-stamps section metadata.
 // Touches nothing — no DB, no network. Run with: npx tsx scripts/validateChunking.ts
+import { spawnSync } from "child_process";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 import { createParentChildChunks, MAX_DOCUMENT_BYTES } from "./lib/utils/chunking.js";
 import { splitMarkdownAware, MAX_CHUNK_BYTES, type Chunk } from "./lib/utils/markdownChunker.js";
 import { isLowValueContent } from "./lib/scrapers/contentFilter.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 type Failures = string[];
 
@@ -458,55 +463,58 @@ const runByteCeilingTest = async (): Promise<Failures> => {
 // that it already exceeds MAX_CHUNK_BYTES BEFORE a single row is added. This
 // is exactly the shape that used to cause a zero-progress infinite loop
 // (re-prepending a header that eats the whole cut budget, recreating the
-// same input forever). Wrapped in a Promise.race timeout so a regression
-// hangs the test with a clear failure instead of hanging the process.
+// same input forever).
+//
+// Codex round-2 finding 3: the table path of splitMarkdownAware is
+// CPU-synchronous, so an in-process `Promise.race` timeout (the old
+// `withTimeout` helper) can never actually catch a regressed infinite loop —
+// a synchronous hang blocks the event loop, and the timer that would reject
+// the race never gets a chance to fire. The only way to make "did it hang?"
+// enforceable is process isolation: run the same doc-building +
+// splitMarkdownAware call in a real subprocess (spawnSync with a wall-clock
+// `timeout` and SIGKILL) so a hang is provably killed rather than merely
+// raced against a timer that shares its own event loop.
 const GIANT_HEADER_ROW_COUNT = 5;
 const giantHeaderRowMarkers: string[] = Array.from(
   { length: GIANT_HEADER_ROW_COUNT },
   (_, i) => `ROW-${String(i + 1).padStart(3, "0")}`,
 );
 
-const buildGiantHeaderTableDoc = (): string => {
-  const header = "| " + "H".repeat(7890) + " |"; // ~7,900 bytes — already over MAX_CHUNK_BYTES alone.
-  const separator = "|---|";
-  const glyphCycle = ["·", "−", "😀"];
-  const rows = giantHeaderRowMarkers.map((tag: string) => {
-    let filler = "";
-    let gi = 0;
-    while (filler.length < 3000) {
-      filler += glyphCycle[gi % glyphCycle.length];
-      gi += 1;
-    }
-    return `| ${tag} ${filler} |`;
-  });
-  return [header, separator, ...rows].join("\n");
-};
-
-const withTimeout = async <T>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
-  let timer: ReturnType<typeof setTimeout>;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label}: did not terminate within ${ms}ms (possible hang)`)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer!);
-  }
-};
+const GIANT_HEADER_PROBE_PATH = join(__dirname, "lib", "utils", "__giantHeaderProbe.ts");
 
 const runGiantHeaderTableTest = async (): Promise<Failures> => {
   const failures: Failures = [];
-  const input = buildGiantHeaderTableDoc();
+
+  const startedAt = Date.now();
+  const result = spawnSync("npx", ["tsx", GIANT_HEADER_PROBE_PATH], {
+    encoding: "utf8",
+    timeout: 30_000,
+    killSignal: "SIGKILL",
+  });
+  console.log(`\n=== Giant-header table probe: ran in subprocess, ${Date.now() - startedAt}ms ===`);
+
+  if (result.error) {
+    failures.push(`giant-header table: probe subprocess failed to launch — ${result.error.message}`);
+    return failures;
+  }
+  if (result.signal) {
+    failures.push(
+      `giant-header table: probe subprocess was killed with signal ${result.signal} (giant-header table hung or crashed)`,
+    );
+    return failures;
+  }
+  if (result.status !== 0) {
+    failures.push(
+      `giant-header table: probe subprocess exited with status ${result.status} (giant-header table hung or crashed) — stderr: ${result.stderr}`,
+    );
+    return failures;
+  }
 
   let chunks: Chunk[];
   try {
-    chunks = await withTimeout(
-      splitMarkdownAware(input, MAX_CHUNK_BYTES + 1000, 0),
-      30000,
-      "giant-header table",
-    );
+    chunks = JSON.parse(result.stdout) as Chunk[];
   } catch (err) {
-    failures.push(`giant-header table: ${(err as Error).message}`);
+    failures.push(`giant-header table: probe subprocess produced unparseable output — ${(err as Error).message}`);
     return failures;
   }
 
