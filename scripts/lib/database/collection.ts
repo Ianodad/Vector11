@@ -158,6 +158,61 @@ const findConfigMismatches = (
 const describeMismatches = (mismatches: ConfigMismatch[]): string =>
   mismatches.map((m) => `${m.field} (expected=${m.expected}, actual=${m.actual})`).join(", ");
 
+const PROBE_RETRY_ATTEMPTS = 3;
+const PROBE_RETRY_DELAY_MS = 5000;
+
+const isMissingFieldIndexError = (err: unknown): boolean =>
+  /CORRUPTED_COLLECTION_SCHEMA|ALLOW FILTERING|schema definition is corrupted/i.test(
+    getErrorMessage(err),
+  );
+
+/**
+ * Canary probe for a partial-materialization failure mode `findConfigMismatches`
+ * cannot see: a collection whose DEFINITION (dimension/metric/lexical/rerank)
+ * verifies clean but whose FIELD INDEXES never materialized. Unfiltered reads,
+ * `_id` lookups, and inserts all succeed on such a collection — only filtered
+ * queries fail, with `CORRUPTED_COLLECTION_SCHEMA` ("would require ALLOW
+ * FILTERING"). Astra says this state can only be recreated, not repaired, so
+ * this must be caught before seeding proceeds.
+ *
+ * Runs a cheap filtered read that matches nothing. On a healthy collection the
+ * query planner accepts it and it resolves (fast) with no results. A missing-
+ * index error is reported as a mismatch; any other (transient) error is
+ * retried a few times, and re-thrown if it never resolves — an unverifiable
+ * collection must not be seeded into.
+ */
+const probeFieldIndexes = async (
+  db: Db,
+  collectionName: string,
+): Promise<ConfigMismatch[]> => {
+  for (let attempt = 1; attempt <= PROBE_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      await db.collection(collectionName).findOne({ type: "__index_probe__" });
+      return [];
+    } catch (err) {
+      if (isMissingFieldIndexError(err)) {
+        return [
+          { field: "field-indexes", expected: "queryable", actual: "missing (ALLOW FILTERING)" },
+        ];
+      }
+
+      const msg = getErrorMessage(err);
+      if (attempt === PROBE_RETRY_ATTEMPTS) {
+        throw new Error(
+          `Field-index probe on '${collectionName}' failed ${PROBE_RETRY_ATTEMPTS} times ` +
+            `(unverifiable collection — refusing to seed into it): ${msg}`,
+        );
+      }
+      console.warn(
+        `Field-index probe on '${collectionName}' attempt ${attempt}/${PROBE_RETRY_ATTEMPTS} failed ` +
+          `(transient, retrying in ${PROBE_RETRY_DELAY_MS}ms): ${msg}`,
+      );
+      await sleepMs(PROBE_RETRY_DELAY_MS);
+    }
+  }
+  return [];
+};
+
 /**
  * Attempt to create the collection, retrying transient/timeout errors with a
  * 10-30s backoff (~4 attempts total). A create that errors client-side after
@@ -278,7 +333,11 @@ export const createCollection = async (
   const verify = async (): Promise<ConfigMismatch[]> => {
     const defs = await listCollectionDefinitions(db);
     const definition = defs.find((c) => c.name === collectionName)?.definition;
-    return findConfigMismatches(definition, expected);
+    const mismatches = findConfigMismatches(definition, expected);
+    if (mismatches.length > 0) return mismatches;
+    // Definition looks clean — still probe for the partial-materialization
+    // variant (missing field indexes) that `findConfigMismatches` can't see.
+    return probeFieldIndexes(db, collectionName);
   };
 
   let mismatches = await verify();
