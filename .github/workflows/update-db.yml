@@ -5,6 +5,11 @@ on:
     # Every Monday at 3:00 AM UTC
     - cron: "0 3 * * 1"
   workflow_dispatch: # Allow manual trigger from GitHub UI
+    inputs:
+      force_recreate:
+        description: "DESTRUCTIVE: drop and rebuild the collection from scratch"
+        type: boolean
+        default: false
 
 jobs:
   update-db:
@@ -41,7 +46,9 @@ jobs:
           OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
           EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1536' }}
           ALLOW_COLLECTION_RECREATE: ${{ vars.ALLOW_COLLECTION_RECREATE || 'true' }}
-          FORCE_COLLECTION_RECREATE: ${{ vars.FORCE_COLLECTION_RECREATE || 'false' }}
+          # Destructive rebuild is opt-in PER RUN via the dispatch input; the
+          # repo variable remains a fallback but scheduled runs stay additive.
+          FORCE_COLLECTION_RECREATE: ${{ (github.event_name == 'workflow_dispatch' && inputs.force_recreate && 'true') || vars.FORCE_COLLECTION_RECREATE || 'false' }}
           EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
           EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
           MAX_SCRAPE_URLS: ${{ vars.MAX_SCRAPE_URLS || '' }}
