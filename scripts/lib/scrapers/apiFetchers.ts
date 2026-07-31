@@ -38,6 +38,27 @@ export const seasonString = (startYear: number): string =>
 /** Understat uses the bare start year as its season path segment: "2025". */
 export const understatSeasonPath = (startYear: number): string => String(startYear);
 
+/**
+ * Best-effort season resolution from a response's own embedded season year
+ * — preferred over a caller-supplied/clock-derived guess, because upstream
+ * APIs (football-data.org, API-Football, ESPN) keep serving a just-concluded
+ * season as "current" until the new one kicks off. Defensive: a non-number
+ * or non-finite value falls back to `fallbackSeason` untouched.
+ */
+const seasonFromYear = (year: unknown, fallbackSeason: string): string =>
+  typeof year === "number" && Number.isFinite(year) ? seasonString(year) : fallbackSeason;
+
+/**
+ * Same idea as `seasonFromYear` but for an ISO date string (football-data.org
+ * ships `season.startDate`, e.g. "2025-08-15") instead of a bare year.
+ * Invalid/missing input falls back to `fallbackSeason`.
+ */
+const seasonFromStartDate = (startDate: unknown, fallbackSeason: string): string => {
+  if (typeof startDate !== "string") return fallbackSeason;
+  const parsed = new Date(startDate);
+  return Number.isNaN(parsed.getTime()) ? fallbackSeason : seasonString(parsed.getUTCFullYear());
+};
+
 // ── Shared plumbing ─────────────────────────────────────────────────────────
 
 /**
@@ -107,6 +128,7 @@ interface EspnStandingsGroup {
   standings?: { entries?: EspnStandingsEntry[] };
 }
 interface EspnStandingsResponse {
+  season?: { year?: number };
   children?: EspnStandingsGroup[];
 }
 
@@ -120,6 +142,7 @@ export const espnStandingsToMarkdown = (
   season: string,
 ): string | null => {
   const data = json as EspnStandingsResponse;
+  const resolvedSeason = seasonFromYear(data.season?.year, season);
   const groups = data.children ?? [];
   const multiGroup = groups.length > 1;
 
@@ -131,7 +154,7 @@ export const espnStandingsToMarkdown = (
     const lines = [
       heading,
       "",
-      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${season}`,
+      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${resolvedSeason}`,
       "",
       HOUSE_TABLE_HEADER,
       HOUSE_TABLE_SEP,
@@ -148,7 +171,7 @@ export const espnStandingsToMarkdown = (
   }
   if (sections.length === 0) return null;
 
-  return [`# ${leagueName} ${season}`, "", ...sections].join("\n") + "\n";
+  return [`# ${leagueName} ${resolvedSeason}`, "", ...sections].join("\n") + "\n";
 };
 
 export const fetchEspnStandings = async (
@@ -181,6 +204,7 @@ interface EspnEvent {
   competitions?: EspnCompetition[];
 }
 interface EspnScoreboardResponse {
+  season?: { year?: number };
   events?: EspnEvent[];
 }
 
@@ -191,6 +215,7 @@ export const espnScoreboardToMarkdown = (
   season: string,
 ): string | null => {
   const data = json as EspnScoreboardResponse;
+  const resolvedSeason = seasonFromYear(data.season?.year, season);
   const events = data.events ?? [];
   if (events.length === 0) return null;
 
@@ -219,11 +244,11 @@ export const espnScoreboardToMarkdown = (
   const type = anyCompleted && anyScheduled ? "Mixed" : anyCompleted ? "Results" : "Fixtures";
 
   const lines = [
-    `# ${leagueName} ${season}`,
+    `# ${leagueName} ${resolvedSeason}`,
     "",
     "## Fixtures / Results",
     "",
-    `> **Type:** ${type}  |  **League:** ${leagueName}  |  **Season:** ${season}`,
+    `> **Type:** ${type}  |  **League:** ${leagueName}  |  **Season:** ${resolvedSeason}`,
     "",
     "| Date | Home | Away | Result |",
     "|:-----|:-----|:-----|:-------|",
@@ -677,9 +702,27 @@ interface FdoStanding {
   group?: string; // set for group-stage competitions, e.g. Champions League
   table?: FdoTableRow[];
 }
+interface FdoSeasonInfo {
+  startDate?: string;
+}
 interface FdoStandingsResponse {
+  season?: FdoSeasonInfo;
   standings?: FdoStanding[];
 }
+
+/**
+ * True when a standings response carries zero usable information — either no
+ * standings groups/rows at all, or every row's `playedGames` is 0 (the
+ * season exists on football-data.org but hasn't kicked off yet). Pure and
+ * exported so the season-fallback decision in `fetchFootballDataOrg` is
+ * directly testable without mocking fetch.
+ */
+export const isStandingsNotStarted = (json: unknown): boolean => {
+  const data = json as FdoStandingsResponse | null;
+  const rows = (data?.standings ?? []).flatMap((group) => group?.table ?? []);
+  if (rows.length === 0) return true;
+  return rows.every((row) => (row?.playedGames ?? 0) === 0);
+};
 
 /**
  * Pure converter — no network. Exported so tests can run on fixture JSON.
@@ -695,6 +738,7 @@ export const footballDataOrgStandingsToMarkdown = (
   season: string,
 ): string | null => {
   const data = json as FdoStandingsResponse;
+  const resolvedSeason = seasonFromStartDate(data?.season?.startDate, season);
   const standings = data?.standings ?? [];
   const multiGroup = standings.length > 1;
 
@@ -706,7 +750,7 @@ export const footballDataOrgStandingsToMarkdown = (
     const lines = [
       heading,
       "",
-      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${season}`,
+      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${resolvedSeason}`,
       "",
       HOUSE_TABLE_HEADER,
       HOUSE_TABLE_SEP,
@@ -740,6 +784,7 @@ interface FdoScorer {
   assists?: number | null;
 }
 interface FdoScorersResponse {
+  season?: FdoSeasonInfo;
   scorers?: FdoScorer[];
 }
 
@@ -754,13 +799,14 @@ export const footballDataOrgScorersToMarkdown = (
   season: string,
 ): string | null => {
   const data = json as FdoScorersResponse;
+  const resolvedSeason = seasonFromStartDate(data?.season?.startDate, season);
   const scorers = data?.scorers ?? [];
   if (scorers.length === 0) return null;
 
   const lines = [
     "## Top Scorers",
     "",
-    `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${season}`,
+    `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${resolvedSeason}`,
     "",
     "| # | Player | Team | Goals | Assists |",
     "|--:|:-------|:-----|------:|--------:|",
@@ -784,19 +830,58 @@ export const footballDataOrgScorersToMarkdown = (
  * Standings + top scorers via football-data.org v4. KEY-GATED — do not call
  * until FOOTBALL_DATA_ORG_KEY (or equivalent) exists; there is no key today.
  * Competition codes: PL, PD, SA, BL1, FL1, CL.
+ *
+ * football-data.org's DEFAULT (no `?season=`) standings alias is internally
+ * inconsistent right around the summer rollover: `season.startDate` already
+ * points at the new season while the table itself is still the complete
+ * previous one. Explicit `?season=` requests are self-consistent, so both
+ * standings and scorers are always requested with an explicit season year:
+ * try the current season-start year first, and if that standings response
+ * is missing/empty or every row shows zero played games (season not started
+ * — zero information), fall back to the previous season once. Scorers are
+ * then requested with whichever year standings settled on, so the two
+ * sections always describe the same season. Never retries beyond that one
+ * fallback — a 403-style "restricted" error on either request already comes
+ * back as `null` via the shared fetchJson plumbing and is left as null.
  */
 export const fetchFootballDataOrg = async (
   competitionCode: string,
   leagueName: string,
   apiKey: string,
 ): Promise<string | null> => {
-  const season = seasonString(currentSeasonStartYear());
   const headers = { "X-Auth-Token": apiKey };
+  const requestedYear = currentSeasonStartYear();
 
-  const [standingsJson, scorersJson] = await Promise.all([
-    fetchJson(`https://api.football-data.org/v4/competitions/${competitionCode}/standings`, headers),
-    fetchJson(`https://api.football-data.org/v4/competitions/${competitionCode}/scorers`, headers),
-  ]);
+  let standingsJson = await fetchJson(
+    `https://api.football-data.org/v4/competitions/${competitionCode}/standings?season=${requestedYear}`,
+    headers,
+  );
+  let settledYear = requestedYear;
+  if (isStandingsNotStarted(standingsJson)) {
+    settledYear = requestedYear - 1;
+    console.warn(
+      `[apiFetchers] football-data.org ${competitionCode} season=${requestedYear} not started — falling back to season=${settledYear}`,
+    );
+    standingsJson = await fetchJson(
+      `https://api.football-data.org/v4/competitions/${competitionCode}/standings?season=${settledYear}`,
+      headers,
+    );
+  }
+
+  const scorersJson = await fetchJson(
+    `https://api.football-data.org/v4/competitions/${competitionCode}/scorers?season=${settledYear}`,
+    headers,
+  );
+
+  // The response's own embedded season (its startDate year) is what the
+  // document title must reflect. With explicit `?season=` requests this is
+  // now consistent by construction — prefer the standings response's season,
+  // falling back to the scorers response's, and finally to the settled
+  // request year itself.
+  const embeddedStartDate =
+    (standingsJson as { season?: { startDate?: string } } | null)?.season?.startDate ??
+    (scorersJson as { season?: { startDate?: string } } | null)?.season?.startDate;
+  const season = seasonFromStartDate(embeddedStartDate, seasonString(settledYear));
 
   const sections: string[] = [];
   if (standingsJson) {
@@ -836,7 +921,7 @@ interface ApiFootballStandingEntry {
   all?: { played?: number; win?: number; draw?: number; lose?: number; goals?: ApiFootballGoals };
 }
 interface ApiFootballLeagueBlock {
-  league?: { standings?: ApiFootballStandingEntry[][] };
+  league?: { season?: number; standings?: ApiFootballStandingEntry[][] };
 }
 interface ApiFootballStandingsResponse {
   response?: ApiFootballLeagueBlock[];
@@ -853,6 +938,7 @@ export const apiFootballStandingsToMarkdown = (
   season: string,
 ): string | null => {
   const data = json as ApiFootballStandingsResponse;
+  const resolvedSeason = seasonFromYear(data?.response?.[0]?.league?.season, season);
   const groups = data?.response?.[0]?.league?.standings ?? [];
   const multiGroup = groups.length > 1;
 
@@ -863,7 +949,7 @@ export const apiFootballStandingsToMarkdown = (
     const lines = [
       heading,
       "",
-      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${season}`,
+      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${resolvedSeason}`,
       "",
       HOUSE_TABLE_HEADER,
       HOUSE_TABLE_SEP,
@@ -885,7 +971,7 @@ export const apiFootballStandingsToMarkdown = (
   });
   if (sections.length === 0) return null;
 
-  return [`# ${leagueName} ${season}`, "", ...sections].join("\n") + "\n";
+  return [`# ${leagueName} ${resolvedSeason}`, "", ...sections].join("\n") + "\n";
 };
 
 /**

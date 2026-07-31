@@ -13,6 +13,7 @@ import {
   openfootballCandidateYears,
   footballDataOrgStandingsToMarkdown,
   footballDataOrgScorersToMarkdown,
+  isStandingsNotStarted,
   apiFootballStandingsToMarkdown,
 } from "./lib/scrapers/apiFetchers.js";
 import { normalizeLeagueName } from "./lib/utils/promptGenerator.js";
@@ -193,6 +194,21 @@ const runEspnStandingsTest = (): Failures => {
   if (espnStandingsToMarkdown({ children: [] }, "Premier League", "2025/26") !== null) {
     failures.push("espn-standings: expected null for empty children array");
   }
+
+  // Regression: the response's own embedded `season.year` must win over the
+  // caller-supplied season — ESPN (like football-data.org) keeps serving a
+  // concluded season as "current" until the new one starts.
+  const embeddedSeasonFixture = { ...espnStandingsFixture, season: { year: 2019 } };
+  const embeddedMd = espnStandingsToMarkdown(embeddedSeasonFixture, "Premier League", "2025/26");
+  if (!embeddedMd || !embeddedMd.includes("2019/20")) {
+    failures.push(
+      `espn-standings-embedded-season: expected response season "2019/20" to win over caller-supplied "2025/26", got ${JSON.stringify(embeddedMd?.slice(0, 40))}`,
+    );
+  }
+  if (embeddedMd && embeddedMd.includes("2025/26")) {
+    failures.push("espn-standings-embedded-season: caller-supplied season leaked into output instead of the response's own season");
+  }
+
   return failures;
 };
 
@@ -236,6 +252,20 @@ const runEspnScoreboardTest = (): Failures => {
   if (espnScoreboardToMarkdown({ events: [] }, "Premier League", "2025/26") !== null) {
     failures.push("espn-scoreboard: expected null for empty events array");
   }
+
+  // Regression: embedded `season.year` must win over the caller-supplied
+  // season, same as espn-standings above.
+  const embeddedSeasonFixture = { ...espnScoreboardFixture, season: { year: 2019 } };
+  const embeddedMd = espnScoreboardToMarkdown(embeddedSeasonFixture, "Premier League", "2025/26");
+  if (!embeddedMd || !embeddedMd.includes("2019/20")) {
+    failures.push(
+      `espn-scoreboard-embedded-season: expected response season "2019/20" to win over caller-supplied "2025/26", got ${JSON.stringify(embeddedMd?.slice(0, 40))}`,
+    );
+  }
+  if (embeddedMd && embeddedMd.includes("2025/26")) {
+    failures.push("espn-scoreboard-embedded-season: caller-supplied season leaked into output instead of the response's own season");
+  }
+
   return failures;
 };
 
@@ -699,6 +729,223 @@ const runFootballDataOrgTest = (): Failures => {
     failures.push("football-data-org-standings-multigroup: expected non-null output");
   }
 
+  // Regression (BLOCKER finding, live-reproduced): the response's own
+  // embedded `season.startDate` must win over the caller-supplied season —
+  // football-data.org keeps serving a just-concluded season as "current"
+  // until the new one kicks off, so the passed-in season alone silently
+  // mislabels a summer-window fetch.
+  const embeddedStandingsFixture = { ...fdoStandingsFixture, season: { startDate: "2019-08-09" } };
+  const embeddedStandingsMd = footballDataOrgStandingsToMarkdown(
+    embeddedStandingsFixture,
+    "Premier League",
+    "2025/26",
+  );
+  if (!embeddedStandingsMd || !embeddedStandingsMd.includes("2019/20")) {
+    failures.push(
+      `football-data-org-standings-embedded-season: expected response season "2019/20" to win over caller-supplied "2025/26", got ${JSON.stringify(embeddedStandingsMd?.slice(0, 80))}`,
+    );
+  }
+  if (embeddedStandingsMd && embeddedStandingsMd.includes("2025/26")) {
+    failures.push(
+      "football-data-org-standings-embedded-season: caller-supplied season leaked into output instead of the response's own season",
+    );
+  }
+
+  const embeddedScorersFixture = { ...fdoScorersFixture, season: { startDate: "2019-08-09" } };
+  const embeddedScorersMd = footballDataOrgScorersToMarkdown(
+    embeddedScorersFixture,
+    "Premier League",
+    "2025/26",
+  );
+  if (!embeddedScorersMd || !embeddedScorersMd.includes("2019/20")) {
+    failures.push(
+      `football-data-org-scorers-embedded-season: expected response season "2019/20" to win over caller-supplied "2025/26", got ${JSON.stringify(embeddedScorersMd?.slice(0, 80))}`,
+    );
+  }
+  if (embeddedScorersMd && embeddedScorersMd.includes("2025/26")) {
+    failures.push(
+      "football-data-org-scorers-embedded-season: caller-supplied season leaked into output instead of the response's own season",
+    );
+  }
+
+  // Invalid startDate must fall back to the caller-supplied season rather
+  // than throwing or emitting garbage.
+  const invalidStartDateFixture = { ...fdoStandingsFixture, season: { startDate: "not-a-date" } };
+  const invalidStartDateMd = assertNoThrow(
+    "football-data-org-standings-invalid-season-date",
+    () => footballDataOrgStandingsToMarkdown(invalidStartDateFixture, "Premier League", "2025/26"),
+    failures,
+  );
+  if (invalidStartDateMd && !invalidStartDateMd.includes("2025/26")) {
+    failures.push(
+      "football-data-org-standings-invalid-season-date: expected fallback to caller-supplied season 2025/26 on an invalid startDate",
+    );
+  }
+
+  return failures;
+};
+
+// ── explicit-season not-started fallback decision (isStandingsNotStarted) ──
+// Regression for the season-boundary bug: football-data.org's DEFAULT
+// (no `?season=`) standings alias mixes a NEW season's `season.startDate`
+// with the previous, COMPLETE season's table. fetchFootballDataOrg now
+// always requests an explicit `?season=` year and uses this pure helper —
+// testable without mocking fetch — to decide whether that response is a
+// genuine "season not started yet" (zero information) response that should
+// trigger a one-time fallback to the previous season instead.
+
+// (a) requested season not started — every row's playedGames is 0.
+const fdoNotStartedFixture = {
+  season: { startDate: "2026-08-21" },
+  standings: [
+    {
+      type: "TOTAL",
+      table: [
+        {
+          position: 1,
+          team: { name: "Arsenal FC" },
+          playedGames: 0,
+          won: 0,
+          draw: 0,
+          lost: 0,
+          points: 0,
+          goalsFor: 0,
+          goalsAgainst: 0,
+          goalDifference: 0,
+        },
+        {
+          position: 2,
+          team: { name: "Liverpool FC" },
+          playedGames: 0,
+          won: 0,
+          draw: 0,
+          lost: 0,
+          points: 0,
+          goalsFor: 0,
+          goalsAgainst: 0,
+          goalDifference: 0,
+        },
+      ],
+    },
+  ],
+};
+
+// The fallback response fetchFootballDataOrg would substitute in once (a)
+// triggers — a complete previous season, self-consistent by construction.
+const fdoPreviousSeasonFixture = {
+  season: { startDate: "2025-08-15" },
+  standings: [
+    {
+      type: "TOTAL",
+      table: [
+        {
+          position: 1,
+          team: { name: "Arsenal FC" },
+          playedGames: 38,
+          won: 28,
+          draw: 6,
+          lost: 4,
+          points: 90,
+          goalsFor: 80,
+          goalsAgainst: 30,
+          goalDifference: 50,
+        },
+      ],
+    },
+  ],
+};
+
+const runIsStandingsNotStartedTest = (): Failures => {
+  const failures: Failures = [];
+
+  // (a) requested-season-not-started → fallback chosen. The helper flags
+  // the zero-games response, and once the caller substitutes in the
+  // previous season's response, THAT response's own label ("2025/26") is
+  // what the document ends up carrying — not the requested season.
+  if (!isStandingsNotStarted(fdoNotStartedFixture)) {
+    failures.push(
+      "isStandingsNotStarted: expected true for a response where every row has playedGames 0",
+    );
+  }
+  const fallbackMd = footballDataOrgStandingsToMarkdown(
+    fdoPreviousSeasonFixture,
+    "Premier League",
+    "2026/27",
+  );
+  if (!fallbackMd || !fallbackMd.includes("2025/26")) {
+    failures.push(
+      `isStandingsNotStarted-fallback-label: expected the fallback response's own label "2025/26" once the previous-season response is used, got ${JSON.stringify(fallbackMd?.slice(0, 40))}`,
+    );
+  }
+
+  // (b) requested season has data → no fallback. The helper must say false
+  // so fetchFootballDataOrg keeps the first (requested-season) response
+  // as-is, and its own label ("2025/26" per fdoStandingsFixture's season) is
+  // what's used — never overridden by a fallback that never happens.
+  if (isStandingsNotStarted(fdoStandingsFixture)) {
+    failures.push("isStandingsNotStarted: expected false for a response with played games > 0");
+  }
+  const noFallbackFixture = { ...fdoStandingsFixture, season: { startDate: "2025-08-15" } };
+  const noFallbackMd = footballDataOrgStandingsToMarkdown(noFallbackFixture, "Premier League", "2025/26");
+  if (!noFallbackMd || !noFallbackMd.includes("2025/26")) {
+    failures.push(
+      `isStandingsNotStarted-no-fallback-label: expected requested season's own label "2025/26" when no fallback is needed, got ${JSON.stringify(noFallbackMd?.slice(0, 40))}`,
+    );
+  }
+
+  // Missing/empty response (no standings at all, or an empty table) counts
+  // as "not started" — zero information either way.
+  if (!isStandingsNotStarted(null)) {
+    failures.push("isStandingsNotStarted: expected true for a null response");
+  }
+  if (!isStandingsNotStarted({ standings: [] })) {
+    failures.push("isStandingsNotStarted: expected true for an empty standings array");
+  }
+  if (!isStandingsNotStarted({ standings: [{ type: "TOTAL", table: [] }] })) {
+    failures.push("isStandingsNotStarted: expected true for a group with an empty table");
+  }
+
+  // A partially-started season (some rows played, some not) is NOT
+  // "not started" — only an ALL-zero table counts as zero information.
+  const mixedFixture = {
+    standings: [
+      {
+        type: "TOTAL",
+        table: [
+          {
+            position: 1,
+            team: { name: "Arsenal FC" },
+            playedGames: 1,
+            won: 1,
+            draw: 0,
+            lost: 0,
+            points: 3,
+            goalsFor: 2,
+            goalsAgainst: 0,
+            goalDifference: 2,
+          },
+          {
+            position: 2,
+            team: { name: "Liverpool FC" },
+            playedGames: 0,
+            won: 0,
+            draw: 0,
+            lost: 0,
+            points: 0,
+            goalsFor: 0,
+            goalsAgainst: 0,
+            goalDifference: 0,
+          },
+        ],
+      },
+    ],
+  };
+  if (isStandingsNotStarted(mixedFixture)) {
+    failures.push(
+      "isStandingsNotStarted: expected false when at least one row has played games (partial season start)",
+    );
+  }
+
   return failures;
 };
 
@@ -790,6 +1037,27 @@ const runApiFootballTest = (): Failures => {
     }
   }
 
+  // Regression: the response's own embedded `league.season` (a number) must
+  // win over the caller-supplied season, same risk pattern as
+  // football-data.org — we pass a season year in, but the response echoes
+  // its own.
+  const embeddedSeasonFixture = {
+    response: [
+      { league: { ...apiFootballFixture.response[0].league, season: 2019 } },
+    ],
+  };
+  const embeddedMd = apiFootballStandingsToMarkdown(embeddedSeasonFixture, "Premier League", "2025/26");
+  if (!embeddedMd || !embeddedMd.includes("2019/20")) {
+    failures.push(
+      `api-football-standings-embedded-season: expected response season "2019/20" to win over caller-supplied "2025/26", got ${JSON.stringify(embeddedMd?.slice(0, 40))}`,
+    );
+  }
+  if (embeddedMd && embeddedMd.includes("2025/26")) {
+    failures.push(
+      "api-football-standings-embedded-season: caller-supplied season leaked into output instead of the response's own season",
+    );
+  }
+
   return failures;
 };
 
@@ -851,6 +1119,7 @@ const main = (): void => {
     ["wikipedia-malformed-table", runWikipediaMalformedTableTest],
     ["openfootball", runOpenfootballTest],
     ["football-data-org", runFootballDataOrgTest],
+    ["football-data-org-not-started-fallback", runIsStandingsNotStartedTest],
     ["api-football", runApiFootballTest],
     ["normalize-league-name-caf", runNormalizeLeagueNameCafTest],
     ["is-stats-site", runIsStatsSiteTest],
