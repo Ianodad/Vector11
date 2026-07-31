@@ -11,6 +11,13 @@ const CACHE_HEADERS = {
   "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
 };
 
+// Shorter cache on the fallback path — a missing/errored corpus doc should
+// self-heal quickly once fixed, rather than being pinned behind the
+// success-path's much longer TTL for up to an hour.
+const FALLBACK_CACHE_HEADERS = {
+  "Cache-Control": "public, s-maxage=300, stale-while-revalidate=3600",
+};
+
 const fallbackResponse = () =>
   Response.json(
     {
@@ -19,7 +26,7 @@ const fallbackResponse = () =>
       generatedAt: null,
       fallback: true,
     },
-    { headers: CACHE_HEADERS },
+    { headers: FALLBACK_CACHE_HEADERS },
   );
 
 export async function GET() {
@@ -68,7 +75,7 @@ export async function GET() {
       { headers: CACHE_HEADERS },
     );
   } catch (error) {
-    console.log("[prompts] Failed to fetch suggested prompts, using fallback:", error);
+    console.error("[prompts] Failed to fetch suggested prompts, using fallback:", error);
     return fallbackResponse();
   }
 }

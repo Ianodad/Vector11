@@ -30,7 +30,14 @@ import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
 import { withRetry, sleep } from "./lib/utils/retry.js";
 import { createParentChildChunks } from "./lib/utils/chunking.js";
 import { extractDocMeta } from "./lib/utils/markdownChunker.js";
-import { generatePrompts, type CorpusFacts } from "./lib/utils/promptGenerator.js";
+import {
+  generatePrompts,
+  normalizeLeagueName,
+  isGenericLeagueName,
+  captureUnderstatFacts,
+  type CorpusFacts,
+  type UnderstatSeasonFacts,
+} from "./lib/utils/promptGenerator.js";
 import { logSummary, writeSummaryLog } from "./lib/utils/logging.js";
 import { isBbcTeamPage, isBlocked, isLikelyHtml } from "./lib/utils/helpers.js";
 import type { SourceItem } from "./lib/config/dataSources.js";
@@ -41,91 +48,16 @@ import type { SourceItem } from "./lib/config/dataSources.js";
 // markdown parsing (regex over content the scraper already produces). No
 // scraper or chunker changes required; see task-weekly-prompts.md.
 
-// Normalizes doc-header league names (e.g. "Premier League") and Understat's
-// own display names into the short codes CorpusFacts/generatePrompts expect.
-const LEAGUE_DISPLAY_TO_CODE: Record<string, string> = {
-  "Premier League": "EPL",
-  EPL: "EPL",
-  "La Liga": "La Liga",
-  "Serie A": "Serie A",
-  Bundesliga: "Bundesliga",
-  "Ligue 1": "Ligue 1",
-  "Champions League": "Champions League",
-  "UEFA Champions League": "Champions League",
-  AFCON: "AFCON",
-};
+// normalizeLeagueName, isGenericLeagueName, captureUnderstatFacts, and
+// UnderstatSeasonFacts now live in ./lib/utils/promptGenerator.js (see the
+// "Corpus facts capture" section there) — this is prompt-domain logic, moved
+// so scripts/validatePrompts.ts can exercise it without going through this
+// seed entrypoint.
 
-const normalizeLeagueName = (raw: string): string =>
-  LEAGUE_DISPLAY_TO_CODE[raw.trim()] ?? raw.trim();
-
-// Only these two leagues are cheaply and reliably derivable from the
-// combined Understat markdown (league-page URL slug -> canonical code).
-// Scoped deliberately per the task spec rather than attempting every league.
-const UNDERSTAT_FACT_LEAGUES: Record<string, string> = {
-  EPL: "EPL",
-  La_liga: "La Liga",
-};
-
-interface UnderstatSeasonFacts {
-  champions: Record<string, string>;
-  topScorers: Record<string, { player: string; goals?: number }>;
-}
-
-// Returns the text between `heading` (exclusive) and the next "## " heading
-// (or end of string) — used to scope a row-position regex to one specific
-// table section instead of matching the first "| 1 | ... |" anywhere.
-const extractSection = (content: string, heading: string): string => {
-  const idx = content.indexOf(heading);
-  if (idx === -1) return "";
-  const rest = content.slice(idx + heading.length);
-  const nextHeadingIdx = rest.search(/\n##\s/);
-  return nextHeadingIdx === -1 ? rest : rest.slice(0, nextHeadingIdx);
-};
-
-// Pulls the cells of the first data row (rank "1") out of a markdown table
-// section, e.g. "| 1 | Liverpool | 38 | ... |" -> ["", "1", "Liverpool", ...].
-const firstDataRowCells = (section: string): string[] | null => {
-  const match = section.match(/\n(\|\s*1\s*\|[^\n]*)/);
-  if (!match) return null;
-  return match[1].split("|").map((cell) => cell.trim());
-};
-
-// Captures the completed-season champion (standings leader, only once the
-// fixture list shows zero matches remaining) and the current top scorer from
-// a combined Understat league markdown document, for EPL/La Liga only.
-const captureUnderstatFacts = (
-  content: string,
-  url: string,
-  bySeason: Map<string, UnderstatSeasonFacts>,
-): void => {
-  const leagueSlugMatch = url.match(/understat\.com\/league\/([^/?#]+)/);
-  const leagueCode = leagueSlugMatch ? UNDERSTAT_FACT_LEAGUES[leagueSlugMatch[1]] : undefined;
-  if (!leagueCode) return;
-
-  const seasonMatch = content.match(/\*\*Season:\*\*\s*([^|\n]+)/);
-  const season = seasonMatch?.[1]?.trim();
-  if (!season) return;
-
-  const bucket = bySeason.get(season) ?? { champions: {}, topScorers: {} };
-
-  const standingsCells = firstDataRowCells(extractSection(content, "## Standings"));
-  const remainingMatch = content.match(/\*\*Remaining:\*\*\s*(\d+)/);
-  const isCompletedSeason = remainingMatch ? Number(remainingMatch[1]) === 0 : false;
-  if (standingsCells?.[2] && isCompletedSeason) {
-    bucket.champions[leagueCode] = standingsCells[2];
-  }
-
-  const rankingCells = firstDataRowCells(extractSection(content, "## Rankings"));
-  if (rankingCells?.[2]) {
-    const goals = Number(rankingCells[6]);
-    bucket.topScorers[leagueCode] = {
-      player: rankingCells[2],
-      ...(Number.isFinite(goals) ? { goals } : {}),
-    };
-  }
-
-  bySeason.set(season, bucket);
-};
+// AFCON sources never carry League header/tag metadata (see extractDocMeta),
+// so gating on docMeta.league alone can never surface AFCON. These URL
+// patterns (soccerway, BBC, Wikipedia variants) are the only reliable signal.
+const AFCON_URL_RE = /africa-cup-of-nations|afcon/i;
 
 const pickMostCommon = (counts: Map<string, number>): string | undefined => {
   let best: string | undefined;
@@ -357,7 +289,16 @@ const processDataSources = async (
       seasonCounts.set(docMeta.season, (seasonCounts.get(docMeta.season) ?? 0) + 1);
     }
     if (docMeta.league) {
-      leaguesSeen.add(normalizeLeagueName(docMeta.league));
+      const normalized = normalizeLeagueName(docMeta.league);
+      if (!isGenericLeagueName(normalized)) {
+        leaguesSeen.add(normalized);
+      }
+    }
+    // AFCON sources never produce League header/tag metadata (see
+    // extractDocMeta), so docMeta.league alone can never surface AFCON —
+    // fall back to a URL-pattern match against the actual AFCON sources.
+    if (AFCON_URL_RE.test(url)) {
+      leaguesSeen.add("AFCON");
     }
     if (type === "understat") {
       captureUnderstatFacts(content, url, understatFactsBySeason);
@@ -660,16 +601,26 @@ const seed = async () => {
       };
       const prompts = generatePrompts(facts);
       const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
-      await collection.replaceOne(
-        { _id: "meta:suggested-prompts" },
-        {
-          type: "meta",
-          season,
-          leagues,
-          prompts,
-          generatedAt: new Date().toISOString(),
-        },
-        { upsert: true },
+      // Retried (modest settings — this is a small metadata upsert, not the
+      // main scrape/embed loop) so a transient Astra error doesn't sink the
+      // whole regeneration on the first hiccup. The outer try/catch below
+      // still only warns on final exhaustion — cosmetic, never fails the seed.
+      await withRetry(
+        "replaceOne:suggested-prompts",
+        () =>
+          collection.replaceOne(
+            { _id: "meta:suggested-prompts" },
+            {
+              type: "meta",
+              season,
+              leagues,
+              prompts,
+              generatedAt: new Date().toISOString(),
+            },
+            { upsert: true },
+          ),
+        3,
+        500,
       );
       console.log(
         `[prompts] Regenerated ${prompts.length} suggested prompts for season ${season} (${leagues.join(", ") || "no leagues detected"})`,
