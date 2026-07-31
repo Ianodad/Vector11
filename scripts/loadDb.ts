@@ -29,9 +29,47 @@ import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
 // Utils
 import { withRetry, sleep } from "./lib/utils/retry.js";
 import { createParentChildChunks } from "./lib/utils/chunking.js";
+import { extractDocMeta } from "./lib/utils/markdownChunker.js";
+import {
+  generatePrompts,
+  normalizeLeagueName,
+  isGenericLeagueName,
+  captureUnderstatFacts,
+  type CorpusFacts,
+  type UnderstatSeasonFacts,
+} from "./lib/utils/promptGenerator.js";
 import { logSummary, writeSummaryLog } from "./lib/utils/logging.js";
 import { isBbcTeamPage, isBlocked, isLikelyHtml } from "./lib/utils/helpers.js";
 import type { SourceItem } from "./lib/config/dataSources.js";
+
+// Suggested-prompts corpus facts capture (season/leagues/champions/scorers).
+// Reuses `extractDocMeta` — the same pure header parser the chunker already
+// uses for section metadata — plus a small amount of Understat-specific
+// markdown parsing (regex over content the scraper already produces). No
+// scraper or chunker changes required; see task-weekly-prompts.md.
+
+// normalizeLeagueName, isGenericLeagueName, captureUnderstatFacts, and
+// UnderstatSeasonFacts now live in ./lib/utils/promptGenerator.js (see the
+// "Corpus facts capture" section there) — this is prompt-domain logic, moved
+// so scripts/validatePrompts.ts can exercise it without going through this
+// seed entrypoint.
+
+// AFCON sources never carry League header/tag metadata (see extractDocMeta),
+// so gating on docMeta.league alone can never surface AFCON. These URL
+// patterns (soccerway, BBC, Wikipedia variants) are the only reliable signal.
+const AFCON_URL_RE = /africa-cup-of-nations|afcon/i;
+
+const pickMostCommon = (counts: Map<string, number>): string | undefined => {
+  let best: string | undefined;
+  let bestCount = -1;
+  for (const [key, count] of counts) {
+    if (count > bestCount) {
+      best = key;
+      bestCount = count;
+    }
+  }
+  return best;
+};
 
 /**
  * Filter sources to only those whose URL or source name contains at least one
@@ -69,6 +107,9 @@ const processDataSources = async (
   skippedUrls: number;
   failedUrls: number;
   attemptedRecords: number;
+  seasonCounts: Map<string, number>;
+  leaguesSeen: Set<string>;
+  understatFactsBySeason: Map<string, UnderstatSeasonFacts>;
 }> => {
   const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
   const queue: SourceItem[] = [...footballData];
@@ -85,6 +126,13 @@ const processDataSources = async (
   const processedUrlList: string[] = [];
   let skippedUrls = 0;
   let failedUrls = 0;
+  // Suggested-prompts corpus facts, harvested alongside the existing
+  // scrape/chunk loop below (see capture block after the low-value-content
+  // check) — used to regenerate the UI's suggested prompts once the seed
+  // succeeds. See top-of-file comment for how these are derived.
+  const seasonCounts = new Map<string, number>();
+  const leaguesSeen = new Set<string>();
+  const understatFactsBySeason = new Map<string, UnderstatSeasonFacts>();
   // Sum of parent+child chunks attempted for insertion (whether or not the
   // insert ultimately succeeded) — used as the basis for the end-of-run
   // sanity assertion against recordsAdded (see BLOCKER 5 mitigation).
@@ -230,6 +278,32 @@ const processDataSources = async (
       continue;
     }
 
+    // Suggested-prompts corpus facts capture — read-only metadata harvesting
+    // from content that is actually about to be chunked into the corpus (so
+    // facts reflect what got seeded, not what was skipped above). Reuses the
+    // same `extractDocMeta` header parser the chunker uses for its own
+    // section metadata; Understat pages are additionally regex-parsed for
+    // the completed-season champion + top scorer (see captureUnderstatFacts).
+    const docMeta = extractDocMeta(content);
+    if (docMeta.season) {
+      seasonCounts.set(docMeta.season, (seasonCounts.get(docMeta.season) ?? 0) + 1);
+    }
+    if (docMeta.league) {
+      const normalized = normalizeLeagueName(docMeta.league);
+      if (!isGenericLeagueName(normalized)) {
+        leaguesSeen.add(normalized);
+      }
+    }
+    // AFCON sources never produce League header/tag metadata (see
+    // extractDocMeta), so docMeta.league alone can never surface AFCON —
+    // fall back to a URL-pattern match against the actual AFCON sources.
+    if (AFCON_URL_RE.test(url)) {
+      leaguesSeen.add("AFCON");
+    }
+    if (type === "understat") {
+      captureUnderstatFacts(content, url, understatFactsBySeason);
+    }
+
     // Parent-child chunking
     const chunkSizes = isStats
       ? {
@@ -342,6 +416,9 @@ const processDataSources = async (
     skippedUrls,
     failedUrls,
     attemptedRecords,
+    seasonCounts,
+    leaguesSeen,
+    understatFactsBySeason,
   };
 };
 
@@ -436,6 +513,9 @@ const seed = async () => {
     skippedUrls,
     failedUrls,
     attemptedRecords,
+    seasonCounts,
+    leaguesSeen,
+    understatFactsBySeason,
   } = await processDataSources(footballData, config, clients, vectorDimensions);
 
   const durationMs = Date.now() - startedAt;
@@ -490,6 +570,65 @@ const seed = async () => {
     totalEmbeddingTokens,
     durationMs,
   });
+
+  // Regenerate the UI's suggested prompts from what THIS seed actually put in
+  // the corpus (season + leagues present, plus a few concrete facts when
+  // cheaply available — see capture block in processDataSources). Runs on the
+  // success path, after the summary/count assertions above, so it can never
+  // affect those counters. Wrapped so a failure here can only WARN — this is
+  // cosmetic (suggested prompts), never worth failing an otherwise-successful
+  // seed over, so process.exitCode is deliberately left untouched below.
+  //
+  // Retrieval safety: this doc is `type: "meta"`, not `type: "child"`. Chat
+  // retrieval (app/api/chat/route.ts) only ever queries `type: "child"` (plus
+  // parent lookups by `_id`), so a `type: "meta"` doc is invisible to it.
+  // It also carries no `$vector`/`$lexical` fields, which Astra collections
+  // accept fine for a plain (non-searched) document.
+  try {
+    const season = pickMostCommon(seasonCounts);
+    if (!season) {
+      console.warn(
+        "[prompts] No season captured from corpus metadata — skipping suggested-prompts regeneration",
+      );
+    } else {
+      const leagues = Array.from(leaguesSeen).sort();
+      const seasonFacts = understatFactsBySeason.get(season);
+      const facts: CorpusFacts = {
+        season,
+        leagues,
+        champions: seasonFacts?.champions,
+        topScorers: seasonFacts?.topScorers,
+      };
+      const prompts = generatePrompts(facts);
+      const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
+      // Retried (modest settings — this is a small metadata upsert, not the
+      // main scrape/embed loop) so a transient Astra error doesn't sink the
+      // whole regeneration on the first hiccup. The outer try/catch below
+      // still only warns on final exhaustion — cosmetic, never fails the seed.
+      await withRetry(
+        "replaceOne:suggested-prompts",
+        () =>
+          collection.replaceOne(
+            { _id: "meta:suggested-prompts" },
+            {
+              type: "meta",
+              season,
+              leagues,
+              prompts,
+              generatedAt: new Date().toISOString(),
+            },
+            { upsert: true },
+          ),
+        3,
+        500,
+      );
+      console.log(
+        `[prompts] Regenerated ${prompts.length} suggested prompts for season ${season} (${leagues.join(", ") || "no leagues detected"})`,
+      );
+    }
+  } catch (err) {
+    console.warn("[prompts] Failed to regenerate suggested prompts (non-fatal):", err);
+  }
 };
 
 seed()
