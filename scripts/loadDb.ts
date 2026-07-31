@@ -29,9 +29,115 @@ import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
 // Utils
 import { withRetry, sleep } from "./lib/utils/retry.js";
 import { createParentChildChunks } from "./lib/utils/chunking.js";
+import { extractDocMeta } from "./lib/utils/markdownChunker.js";
+import { generatePrompts, type CorpusFacts } from "./lib/utils/promptGenerator.js";
 import { logSummary, writeSummaryLog } from "./lib/utils/logging.js";
 import { isBbcTeamPage, isBlocked, isLikelyHtml } from "./lib/utils/helpers.js";
 import type { SourceItem } from "./lib/config/dataSources.js";
+
+// Suggested-prompts corpus facts capture (season/leagues/champions/scorers).
+// Reuses `extractDocMeta` — the same pure header parser the chunker already
+// uses for section metadata — plus a small amount of Understat-specific
+// markdown parsing (regex over content the scraper already produces). No
+// scraper or chunker changes required; see task-weekly-prompts.md.
+
+// Normalizes doc-header league names (e.g. "Premier League") and Understat's
+// own display names into the short codes CorpusFacts/generatePrompts expect.
+const LEAGUE_DISPLAY_TO_CODE: Record<string, string> = {
+  "Premier League": "EPL",
+  EPL: "EPL",
+  "La Liga": "La Liga",
+  "Serie A": "Serie A",
+  Bundesliga: "Bundesliga",
+  "Ligue 1": "Ligue 1",
+  "Champions League": "Champions League",
+  "UEFA Champions League": "Champions League",
+  AFCON: "AFCON",
+};
+
+const normalizeLeagueName = (raw: string): string =>
+  LEAGUE_DISPLAY_TO_CODE[raw.trim()] ?? raw.trim();
+
+// Only these two leagues are cheaply and reliably derivable from the
+// combined Understat markdown (league-page URL slug -> canonical code).
+// Scoped deliberately per the task spec rather than attempting every league.
+const UNDERSTAT_FACT_LEAGUES: Record<string, string> = {
+  EPL: "EPL",
+  La_liga: "La Liga",
+};
+
+interface UnderstatSeasonFacts {
+  champions: Record<string, string>;
+  topScorers: Record<string, { player: string; goals?: number }>;
+}
+
+// Returns the text between `heading` (exclusive) and the next "## " heading
+// (or end of string) — used to scope a row-position regex to one specific
+// table section instead of matching the first "| 1 | ... |" anywhere.
+const extractSection = (content: string, heading: string): string => {
+  const idx = content.indexOf(heading);
+  if (idx === -1) return "";
+  const rest = content.slice(idx + heading.length);
+  const nextHeadingIdx = rest.search(/\n##\s/);
+  return nextHeadingIdx === -1 ? rest : rest.slice(0, nextHeadingIdx);
+};
+
+// Pulls the cells of the first data row (rank "1") out of a markdown table
+// section, e.g. "| 1 | Liverpool | 38 | ... |" -> ["", "1", "Liverpool", ...].
+const firstDataRowCells = (section: string): string[] | null => {
+  const match = section.match(/\n(\|\s*1\s*\|[^\n]*)/);
+  if (!match) return null;
+  return match[1].split("|").map((cell) => cell.trim());
+};
+
+// Captures the completed-season champion (standings leader, only once the
+// fixture list shows zero matches remaining) and the current top scorer from
+// a combined Understat league markdown document, for EPL/La Liga only.
+const captureUnderstatFacts = (
+  content: string,
+  url: string,
+  bySeason: Map<string, UnderstatSeasonFacts>,
+): void => {
+  const leagueSlugMatch = url.match(/understat\.com\/league\/([^/?#]+)/);
+  const leagueCode = leagueSlugMatch ? UNDERSTAT_FACT_LEAGUES[leagueSlugMatch[1]] : undefined;
+  if (!leagueCode) return;
+
+  const seasonMatch = content.match(/\*\*Season:\*\*\s*([^|\n]+)/);
+  const season = seasonMatch?.[1]?.trim();
+  if (!season) return;
+
+  const bucket = bySeason.get(season) ?? { champions: {}, topScorers: {} };
+
+  const standingsCells = firstDataRowCells(extractSection(content, "## Standings"));
+  const remainingMatch = content.match(/\*\*Remaining:\*\*\s*(\d+)/);
+  const isCompletedSeason = remainingMatch ? Number(remainingMatch[1]) === 0 : false;
+  if (standingsCells?.[2] && isCompletedSeason) {
+    bucket.champions[leagueCode] = standingsCells[2];
+  }
+
+  const rankingCells = firstDataRowCells(extractSection(content, "## Rankings"));
+  if (rankingCells?.[2]) {
+    const goals = Number(rankingCells[6]);
+    bucket.topScorers[leagueCode] = {
+      player: rankingCells[2],
+      ...(Number.isFinite(goals) ? { goals } : {}),
+    };
+  }
+
+  bySeason.set(season, bucket);
+};
+
+const pickMostCommon = (counts: Map<string, number>): string | undefined => {
+  let best: string | undefined;
+  let bestCount = -1;
+  for (const [key, count] of counts) {
+    if (count > bestCount) {
+      best = key;
+      bestCount = count;
+    }
+  }
+  return best;
+};
 
 /**
  * Filter sources to only those whose URL or source name contains at least one
@@ -69,6 +175,9 @@ const processDataSources = async (
   skippedUrls: number;
   failedUrls: number;
   attemptedRecords: number;
+  seasonCounts: Map<string, number>;
+  leaguesSeen: Set<string>;
+  understatFactsBySeason: Map<string, UnderstatSeasonFacts>;
 }> => {
   const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
   const queue: SourceItem[] = [...footballData];
@@ -85,6 +194,13 @@ const processDataSources = async (
   const processedUrlList: string[] = [];
   let skippedUrls = 0;
   let failedUrls = 0;
+  // Suggested-prompts corpus facts, harvested alongside the existing
+  // scrape/chunk loop below (see capture block after the low-value-content
+  // check) — used to regenerate the UI's suggested prompts once the seed
+  // succeeds. See top-of-file comment for how these are derived.
+  const seasonCounts = new Map<string, number>();
+  const leaguesSeen = new Set<string>();
+  const understatFactsBySeason = new Map<string, UnderstatSeasonFacts>();
   // Sum of parent+child chunks attempted for insertion (whether or not the
   // insert ultimately succeeded) — used as the basis for the end-of-run
   // sanity assertion against recordsAdded (see BLOCKER 5 mitigation).
@@ -230,6 +346,23 @@ const processDataSources = async (
       continue;
     }
 
+    // Suggested-prompts corpus facts capture — read-only metadata harvesting
+    // from content that is actually about to be chunked into the corpus (so
+    // facts reflect what got seeded, not what was skipped above). Reuses the
+    // same `extractDocMeta` header parser the chunker uses for its own
+    // section metadata; Understat pages are additionally regex-parsed for
+    // the completed-season champion + top scorer (see captureUnderstatFacts).
+    const docMeta = extractDocMeta(content);
+    if (docMeta.season) {
+      seasonCounts.set(docMeta.season, (seasonCounts.get(docMeta.season) ?? 0) + 1);
+    }
+    if (docMeta.league) {
+      leaguesSeen.add(normalizeLeagueName(docMeta.league));
+    }
+    if (type === "understat") {
+      captureUnderstatFacts(content, url, understatFactsBySeason);
+    }
+
     // Parent-child chunking
     const chunkSizes = isStats
       ? {
@@ -342,6 +475,9 @@ const processDataSources = async (
     skippedUrls,
     failedUrls,
     attemptedRecords,
+    seasonCounts,
+    leaguesSeen,
+    understatFactsBySeason,
   };
 };
 
@@ -436,6 +572,9 @@ const seed = async () => {
     skippedUrls,
     failedUrls,
     attemptedRecords,
+    seasonCounts,
+    leaguesSeen,
+    understatFactsBySeason,
   } = await processDataSources(footballData, config, clients, vectorDimensions);
 
   const durationMs = Date.now() - startedAt;
@@ -490,6 +629,55 @@ const seed = async () => {
     totalEmbeddingTokens,
     durationMs,
   });
+
+  // Regenerate the UI's suggested prompts from what THIS seed actually put in
+  // the corpus (season + leagues present, plus a few concrete facts when
+  // cheaply available — see capture block in processDataSources). Runs on the
+  // success path, after the summary/count assertions above, so it can never
+  // affect those counters. Wrapped so a failure here can only WARN — this is
+  // cosmetic (suggested prompts), never worth failing an otherwise-successful
+  // seed over, so process.exitCode is deliberately left untouched below.
+  //
+  // Retrieval safety: this doc is `type: "meta"`, not `type: "child"`. Chat
+  // retrieval (app/api/chat/route.ts) only ever queries `type: "child"` (plus
+  // parent lookups by `_id`), so a `type: "meta"` doc is invisible to it.
+  // It also carries no `$vector`/`$lexical` fields, which Astra collections
+  // accept fine for a plain (non-searched) document.
+  try {
+    const season = pickMostCommon(seasonCounts);
+    if (!season) {
+      console.warn(
+        "[prompts] No season captured from corpus metadata — skipping suggested-prompts regeneration",
+      );
+    } else {
+      const leagues = Array.from(leaguesSeen).sort();
+      const seasonFacts = understatFactsBySeason.get(season);
+      const facts: CorpusFacts = {
+        season,
+        leagues,
+        champions: seasonFacts?.champions,
+        topScorers: seasonFacts?.topScorers,
+      };
+      const prompts = generatePrompts(facts);
+      const collection = clients.db.collection(config.ASTRA_DB_COLLECTION);
+      await collection.replaceOne(
+        { _id: "meta:suggested-prompts" },
+        {
+          type: "meta",
+          season,
+          leagues,
+          prompts,
+          generatedAt: new Date().toISOString(),
+        },
+        { upsert: true },
+      );
+      console.log(
+        `[prompts] Regenerated ${prompts.length} suggested prompts for season ${season} (${leagues.join(", ") || "no leagues detected"})`,
+      );
+    }
+  } catch (err) {
+    console.warn("[prompts] Failed to regenerate suggested prompts (non-fatal):", err);
+  }
 };
 
 seed()
