@@ -1,13 +1,19 @@
 // footballDataGroups builder with 80+ sources
 import { EPL_TEAM_SLUGS_ALL } from "./constants.js";
 import { isEnabled, resolveTeamPageCount, resolveTeamSlugs } from "./env.js";
+import { currentSeasonStartYear, understatSeasonPath } from "../scrapers/apiFetchers.js";
 
 export type SourceType =
   | "html"
   | "rss"
   | "soccerway_form"
   | "soccerway_lineups"
-  | "understat";
+  | "understat"
+  | "espn-api"
+  | "wikipedia-api"
+  | "openfootball"
+  | "football-data-api"
+  | "api-football";
 
 export interface SourceItem {
   url: string;
@@ -18,6 +24,17 @@ export interface SourceItem {
   // Soccerway form table metadata
   formMode?: "home" | "away" | "overall";
   formMatches?: number;
+  // API-fetcher metadata (see scripts/lib/scrapers/apiFetchers.ts) — mirrors
+  // each fetcher's own args; only the fields a given `type` actually needs
+  // are set on any one entry.
+  leagueName?: string; // display name used in the fetcher's house-format header
+  leagueCode?: string; // ESPN soccer league slug, e.g. "eng.1"
+  espnEndpoint?: "standings" | "scoreboard"; // which ESPN fetcher to call
+  wikiTitle?: string; // MediaWiki page title (may be computed dynamically)
+  wikiDocType?: string; // house-format Type hint: standings|fixtures|results|mixed
+  leaguePath?: string; // openfootball league path, e.g. "en.1"
+  competitionCode?: string; // football-data.org competition code, e.g. "PL"
+  apiLeagueId?: number; // api-football (api-sports.io) league id
 }
 
 export type SourceCategory =
@@ -62,6 +79,16 @@ export const buildFootballDataGroups = (
   eplTeamPages: string | undefined,
   eplTeamSlugs: string | undefined,
 ): Record<SourceCategory, SourceItem[]> => {
+  // Computed once per build so every dynamic-season entry below (Understat,
+  // Wikipedia's current-season article) rolls forward automatically instead
+  // of needing a yearly manual edit.
+  const currentYear = currentSeasonStartYear();
+  const previousYear = currentYear - 1;
+  const nextYearSuffix = String((currentYear + 1) % 100).padStart(2, "0");
+  // en-dash (U+2013), matching Wikipedia's own season-title convention, e.g.
+  // "2025–26_Premier_League".
+  const currentPlSeasonTitle = `${currentYear}–${nextYearSuffix}_Premier_League`;
+
   return {
     // ============================================
     // NEWS - Easy to scrape, reliable
@@ -98,31 +125,9 @@ export const buildFootballDataGroups = (
         source: "BBC Women's Football",
         delay: 2,
       },
-      // ESPN - Clean HTML structure
-      // {
-      //   url: "https://www.espn.com/soccer/",
-      //   type: "html",
-      //   source: "ESPN Soccer",
-      //   delay: 2,
-      // },
-      {
-        url: "https://www.espn.com/soccer/league/_/name/eng.1",
-        type: "html",
-        source: "ESPN EPL",
-        delay: 2,
-      },
-      // {
-      //   url: "https://www.espn.com/soccer/africa/",
-      //   type: "html",
-      //   source: "ESPN Africa",
-      //   delay: 2,
-      // },
-      {
-        url: "https://www.espn.com/soccer/scoreboard",
-        type: "html",
-        source: "ESPN Scoreboard",
-        delay: 2,
-      },
+      // ESPN HTML snapshots removed — replaced by zero-key `espn-api`
+      // entries (standings live in `stats`, scoreboard in `fixtures`) that
+      // cover the big-5 leagues via ESPN's JSON API instead of one page.
       // The Guardian - Reliable HTML
       {
         url: "https://www.theguardian.com/football",
@@ -191,6 +196,102 @@ export const buildFootballDataGroups = (
     // STATS - Expanded Understat coverage
     // ============================================
     stats: [
+      // ESPN API - standings (JSON, no key) - big-5 leagues
+      {
+        url: "https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings",
+        type: "espn-api",
+        espnEndpoint: "standings",
+        leagueCode: "eng.1",
+        leagueName: "Premier League",
+        source: "ESPN API EPL Standings",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/v2/sports/soccer/esp.1/standings",
+        type: "espn-api",
+        espnEndpoint: "standings",
+        leagueCode: "esp.1",
+        leagueName: "La Liga",
+        source: "ESPN API La Liga Standings",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/v2/sports/soccer/ita.1/standings",
+        type: "espn-api",
+        espnEndpoint: "standings",
+        leagueCode: "ita.1",
+        leagueName: "Serie A",
+        source: "ESPN API Serie A Standings",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/v2/sports/soccer/ger.1/standings",
+        type: "espn-api",
+        espnEndpoint: "standings",
+        leagueCode: "ger.1",
+        leagueName: "Bundesliga",
+        source: "ESPN API Bundesliga Standings",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/v2/sports/soccer/fra.1/standings",
+        type: "espn-api",
+        espnEndpoint: "standings",
+        leagueCode: "fra.1",
+        leagueName: "Ligue 1",
+        source: "ESPN API Ligue 1 Standings",
+        delay: 2,
+      },
+      // football-data.org (KEY-GATED — needs FOOTBALL_DATA_API_KEY) -
+      // standings + top scorers, big-5 + UCL
+      {
+        url: "https://api.football-data.org/v4/competitions/PL/standings",
+        type: "football-data-api",
+        competitionCode: "PL",
+        leagueName: "Premier League",
+        source: "football-data.org EPL",
+        delay: 2,
+      },
+      {
+        url: "https://api.football-data.org/v4/competitions/PD/standings",
+        type: "football-data-api",
+        competitionCode: "PD",
+        leagueName: "La Liga",
+        source: "football-data.org La Liga",
+        delay: 2,
+      },
+      {
+        url: "https://api.football-data.org/v4/competitions/SA/standings",
+        type: "football-data-api",
+        competitionCode: "SA",
+        leagueName: "Serie A",
+        source: "football-data.org Serie A",
+        delay: 2,
+      },
+      {
+        url: "https://api.football-data.org/v4/competitions/BL1/standings",
+        type: "football-data-api",
+        competitionCode: "BL1",
+        leagueName: "Bundesliga",
+        source: "football-data.org Bundesliga",
+        delay: 2,
+      },
+      {
+        url: "https://api.football-data.org/v4/competitions/FL1/standings",
+        type: "football-data-api",
+        competitionCode: "FL1",
+        leagueName: "Ligue 1",
+        source: "football-data.org Ligue 1",
+        delay: 2,
+      },
+      {
+        url: "https://api.football-data.org/v4/competitions/CL/standings",
+        type: "football-data-api",
+        competitionCode: "CL",
+        leagueName: "Champions League",
+        source: "football-data.org Champions League",
+        delay: 2,
+      },
       // Understat - BEST STATS SOURCE (JSON in script tags)
       {
         url: "https://understat.com/league/EPL",
@@ -199,15 +300,15 @@ export const buildFootballDataGroups = (
         delay: 3,
       },
       {
-        url: "https://understat.com/league/EPL/2024",
+        url: `https://understat.com/league/EPL/${understatSeasonPath(currentYear)}`,
         type: "understat",
-        source: "Understat EPL 2024",
+        source: `Understat EPL ${understatSeasonPath(currentYear)}`,
         delay: 3,
       },
       {
-        url: "https://understat.com/league/EPL/2025",
+        url: `https://understat.com/league/EPL/${understatSeasonPath(previousYear)}`,
         type: "understat",
-        source: "Understat EPL 2025",
+        source: `Understat EPL ${understatSeasonPath(previousYear)}`,
         delay: 3,
       },
       {
@@ -217,15 +318,15 @@ export const buildFootballDataGroups = (
         delay: 3,
       },
       {
-        url: "https://understat.com/league/La_liga/2024",
+        url: `https://understat.com/league/La_liga/${understatSeasonPath(currentYear)}`,
         type: "understat",
-        source: "Understat La Liga 2024",
+        source: `Understat La Liga ${understatSeasonPath(currentYear)}`,
         delay: 3,
       },
       {
-        url: "https://understat.com/league/La_liga/2025",
+        url: `https://understat.com/league/La_liga/${understatSeasonPath(previousYear)}`,
         type: "understat",
-        source: "Understat La Liga 2025",
+        source: `Understat La Liga ${understatSeasonPath(previousYear)}`,
         delay: 3,
       },
       {
@@ -235,15 +336,15 @@ export const buildFootballDataGroups = (
         delay: 3,
       },
       {
-        url: "https://understat.com/league/Serie_A/2024",
+        url: `https://understat.com/league/Serie_A/${understatSeasonPath(currentYear)}`,
         type: "understat",
-        source: "Understat Serie A 2024",
+        source: `Understat Serie A ${understatSeasonPath(currentYear)}`,
         delay: 3,
       },
       {
-        url: "https://understat.com/league/Serie_A/2025",
+        url: `https://understat.com/league/Serie_A/${understatSeasonPath(previousYear)}`,
         type: "understat",
-        source: "Understat Serie A 2025",
+        source: `Understat Serie A ${understatSeasonPath(previousYear)}`,
         delay: 3,
       },
       {
@@ -253,15 +354,15 @@ export const buildFootballDataGroups = (
         delay: 3,
       },
       {
-        url: "https://understat.com/league/Bundesliga/2024",
+        url: `https://understat.com/league/Bundesliga/${understatSeasonPath(currentYear)}`,
         type: "understat",
-        source: "Understat Bundesliga 2024",
+        source: `Understat Bundesliga ${understatSeasonPath(currentYear)}`,
         delay: 3,
       },
       {
-        url: "https://understat.com/league/Bundesliga/2025",
+        url: `https://understat.com/league/Bundesliga/${understatSeasonPath(previousYear)}`,
         type: "understat",
-        source: "Understat Bundesliga 2025",
+        source: `Understat Bundesliga ${understatSeasonPath(previousYear)}`,
         delay: 3,
       },
       {
@@ -271,36 +372,19 @@ export const buildFootballDataGroups = (
         delay: 3,
       },
       {
-        url: "https://understat.com/league/Ligue_1/2024",
+        url: `https://understat.com/league/Ligue_1/${understatSeasonPath(currentYear)}`,
         type: "understat",
-        source: "Understat Ligue 1 2024",
+        source: `Understat Ligue 1 ${understatSeasonPath(currentYear)}`,
         delay: 3,
       },
       {
-        url: "https://understat.com/league/Ligue_1/2025",
+        url: `https://understat.com/league/Ligue_1/${understatSeasonPath(previousYear)}`,
         type: "understat",
-        source: "Understat Ligue 1 2025",
+        source: `Understat Ligue 1 ${understatSeasonPath(previousYear)}`,
         delay: 3,
       },
-      // SoccerStats - Static HTML tables
-      // {
-      //   url: "https://www.soccerstats.com/latest.asp",
-      //   type: "html",
-      //   source: "SoccerStats",
-      //   delay: 3,
-      // },
-      // {
-      //   url: "https://www.soccerstats.com/league.asp?league=england",
-      //   type: "html",
-      //   source: "SoccerStats EPL",
-      //   delay: 3,
-      // },
-      // {
-      //   url: "https://www.soccerstats.com/homeaway.asp?league=england",
-      //   type: "html",
-      //   source: "SoccerStats Home/Away",
-      //   delay: 3,
-      // },
+      // SoccerStats - permanently 403 for this scraper — removed.
+      // Replacement: ESPN API / football-data.org standings above.
       // FootyStats - Accessible
       // {
       //   url: "https://footystats.org/england/premier-league",
@@ -314,55 +398,110 @@ export const buildFootballDataGroups = (
       //   source: "FootyStats Results",
       //   delay: 3,
       // },
-      // FBref - CRITICAL 6 SECOND DELAY
-      // {
-      //   url: "https://fbref.com/en/comps/9/Premier-League-Stats",
-      //   type: "html",
-      //   source: "FBref EPL",
-      //   delay: 6, // DO NOT REDUCE - will ban you
-      // },
-      // {
-      //   url: "https://fbref.com/en/comps/9/schedule/Premier-League-Scores-and-Fixtures",
-      //   type: "html",
-      //   source: "FBref EPL Fixtures",
-      //   delay: 6,
-      // },
-      // {
-      //   url: "https://fbref.com/en/comps/9/stats/Premier-League-Stats",
-      //   type: "html",
-      //   source: "FBref EPL Team Stats",
-      //   delay: 6,
-      // },
+      // FBref (EPL stats/fixtures/team-stats) - permanently 403 for this
+      // scraper — removed. Replacement: ESPN API / football-data.org above.
     ],
 
     // ============================================
     // PLAYER PERFORMANCE
     // ============================================
     playerPerformance: [
-      // {
-      //   url: "https://fbref.com/en/comps/9/stats/Premier-League-Player-Stats",
-      //   type: "html",
-      //   source: "FBref Player Stats EPL",
-      //   delay: 6,
-      // },
-      // {
-      //   url: "https://fbref.com/en/comps/9/shooting/Premier-League-Stats",
-      //   type: "html",
-      //   source: "FBref Shooting Stats",
-      //   delay: 6,
-      // },
-      // {
-      //   url: "https://fbref.com/en/comps/9/passing/Premier-League-Stats",
-      //   type: "html",
-      //   source: "FBref Passing Stats",
-      //   delay: 6,
-      // },
+      // FBref (player/shooting/passing stats) - permanently 403 for this
+      // scraper — removed. Replacement: football-data.org top scorers
+      // (football-data-api, in `stats`).
     ],
 
     // ============================================
     // FIXTURES - Very scrapeable
     // ============================================
     fixtures: [
+      // ESPN API - scoreboard/results (JSON, no key) - big-5 leagues
+      {
+        url: "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+        type: "espn-api",
+        espnEndpoint: "scoreboard",
+        leagueCode: "eng.1",
+        leagueName: "Premier League",
+        source: "ESPN API EPL Scoreboard",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard",
+        type: "espn-api",
+        espnEndpoint: "scoreboard",
+        leagueCode: "esp.1",
+        leagueName: "La Liga",
+        source: "ESPN API La Liga Scoreboard",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/site/v2/sports/soccer/ita.1/scoreboard",
+        type: "espn-api",
+        espnEndpoint: "scoreboard",
+        leagueCode: "ita.1",
+        leagueName: "Serie A",
+        source: "ESPN API Serie A Scoreboard",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/site/v2/sports/soccer/ger.1/scoreboard",
+        type: "espn-api",
+        espnEndpoint: "scoreboard",
+        leagueCode: "ger.1",
+        leagueName: "Bundesliga",
+        source: "ESPN API Bundesliga Scoreboard",
+        delay: 2,
+      },
+      {
+        url: "https://site.api.espn.com/apis/site/v2/sports/soccer/fra.1/scoreboard",
+        type: "espn-api",
+        espnEndpoint: "scoreboard",
+        leagueCode: "fra.1",
+        leagueName: "Ligue 1",
+        source: "ESPN API Ligue 1 Scoreboard",
+        delay: 2,
+      },
+      // openfootball - full-season fixtures/results JSON (no key), current season
+      {
+        url: `https://raw.githubusercontent.com/openfootball/football.json/master/${currentYear}-${nextYearSuffix}/en.1.json`,
+        type: "openfootball",
+        leaguePath: "en.1",
+        leagueName: "Premier League",
+        source: "openfootball EPL",
+        delay: 2,
+      },
+      {
+        url: `https://raw.githubusercontent.com/openfootball/football.json/master/${currentYear}-${nextYearSuffix}/es.1.json`,
+        type: "openfootball",
+        leaguePath: "es.1",
+        leagueName: "La Liga",
+        source: "openfootball La Liga",
+        delay: 2,
+      },
+      {
+        url: `https://raw.githubusercontent.com/openfootball/football.json/master/${currentYear}-${nextYearSuffix}/it.1.json`,
+        type: "openfootball",
+        leaguePath: "it.1",
+        leagueName: "Serie A",
+        source: "openfootball Serie A",
+        delay: 2,
+      },
+      {
+        url: `https://raw.githubusercontent.com/openfootball/football.json/master/${currentYear}-${nextYearSuffix}/de.1.json`,
+        type: "openfootball",
+        leaguePath: "de.1",
+        leagueName: "Bundesliga",
+        source: "openfootball Bundesliga",
+        delay: 2,
+      },
+      {
+        url: `https://raw.githubusercontent.com/openfootball/football.json/master/${currentYear}-${nextYearSuffix}/fr.1.json`,
+        type: "openfootball",
+        leaguePath: "fr.1",
+        leagueName: "Ligue 1",
+        source: "openfootball Ligue 1",
+        delay: 2,
+      },
       // Soccerway - 5 second delay per robots.txt
       {
         url: "https://int.soccerway.com/national/england/premier-league/",
@@ -473,25 +612,9 @@ export const buildFootballDataGroups = (
         source: "Soccerway Europa League Fixtures",
         delay: 5,
       },
-      // WorldFootball.net - VERY accessible
-      // {
-      //   url: "https://www.worldfootball.net/all_matches/eng-premier-league/",
-      //   type: "html",
-      //   source: "WorldFootball EPL Matches",
-      //   delay: 2,
-      // },
-      // {
-      //   url: "https://www.worldfootball.net/schedule/eng-premier-league/",
-      //   type: "html",
-      //   source: "WorldFootball EPL Schedule",
-      //   delay: 2,
-      // },
-      // {
-      //   url: "https://www.worldfootball.net/schedule/afr-africa-cup-of-nations/",
-      //   type: "html",
-      //   source: "WorldFootball AFCON",
-      //   delay: 2,
-      // },
+      // WorldFootball.net - permanently 403 for this scraper — removed.
+      // Replacement: openfootball fixtures/results above (AFCON coverage
+      // moves to api-football league 6, in `afcon`).
     ],
 
     // ============================================
@@ -546,6 +669,25 @@ export const buildFootballDataGroups = (
     // AFCON - Expanded coverage
     // ============================================
     afcon: [
+      // api-football (api-sports.io) (KEY-GATED — needs API_FOOTBALL_KEY) -
+      // standings, filling the African coverage gap left by the removed
+      // WorldFootball AFCON page.
+      {
+        url: "https://v3.football.api-sports.io/standings?league=6",
+        type: "api-football",
+        apiLeagueId: 6,
+        leagueName: "AFCON",
+        source: "api-football AFCON Standings",
+        delay: 2,
+      },
+      {
+        url: "https://v3.football.api-sports.io/standings?league=12",
+        type: "api-football",
+        apiLeagueId: 12,
+        leagueName: "CAF Champions League",
+        source: "api-football CAF Champions League Standings",
+        delay: 2,
+      },
       {
         url: "https://www.bbc.com/sport/football/africa-cup-of-nations",
         type: "html",
@@ -578,112 +720,167 @@ export const buildFootballDataGroups = (
       // Premier League
       {
         url: "https://en.wikipedia.org/wiki/Premier_League",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Premier_League",
+        wikiDocType: "mixed",
+        leagueName: "Premier League",
         source: "Wikipedia – Premier League",
         delay: 1,
       },
+      // DYNAMIC: title rolls forward automatically from currentSeasonStartYear().
       {
-        url: "https://en.wikipedia.org/wiki/2024%E2%80%9325_Premier_League",
-        type: "html",
-        source: "Wikipedia – 2024-25 Premier League",
+        url: `https://en.wikipedia.org/wiki/${currentPlSeasonTitle}`,
+        type: "wikipedia-api",
+        wikiTitle: currentPlSeasonTitle,
+        wikiDocType: "standings",
+        leagueName: "Premier League",
+        source: `Wikipedia – ${currentYear}-${nextYearSuffix} Premier League`,
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/List_of_Premier_League_clubs",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "List_of_Premier_League_clubs",
+        wikiDocType: "mixed",
+        leagueName: "Premier League",
         source: "Wikipedia – EPL Clubs",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/List_of_foreign_Premier_League_players",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "List_of_foreign_Premier_League_players",
+        wikiDocType: "mixed",
+        leagueName: "Premier League",
         source: "Wikipedia – Foreign EPL players",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/List_of_one-club_men_in_association_football",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "List_of_one-club_men_in_association_football",
+        wikiDocType: "mixed",
+        leagueName: "Football",
         source: "Wikipedia – One-club men",
         delay: 1,
       },
       // AFCON
       {
         url: "https://en.wikipedia.org/wiki/2025_Africa_Cup_of_Nations",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "2025_Africa_Cup_of_Nations",
+        wikiDocType: "mixed",
+        leagueName: "AFCON",
         source: "Wikipedia – AFCON 2025",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Africa_Cup_of_Nations",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Africa_Cup_of_Nations",
+        wikiDocType: "mixed",
+        leagueName: "AFCON",
         source: "Wikipedia – Africa Cup of Nations",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Africa_Cup_of_Nations_records_and_statistics",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Africa_Cup_of_Nations_records_and_statistics",
+        wikiDocType: "mixed",
+        leagueName: "AFCON",
         source: "Wikipedia – AFCON records & stats",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/African_Footballer_of_the_Year",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "African_Footballer_of_the_Year",
+        wikiDocType: "mixed",
+        leagueName: "AFCON",
         source: "Wikipedia – African Footballer of the Year",
         delay: 1,
       },
       // General Football
       {
         url: "https://en.wikipedia.org/wiki/Association_football",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Association_football",
+        wikiDocType: "mixed",
+        leagueName: "Football",
         source: "Wikipedia – Association football",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Football_player",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Football_player",
+        wikiDocType: "mixed",
+        leagueName: "Football",
         source: "Wikipedia – Football player",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/History_of_association_football",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "History_of_association_football",
+        wikiDocType: "mixed",
+        leagueName: "Football",
         source: "Wikipedia – History of football",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Football_club_(association_football)",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Football_club_(association_football)",
+        wikiDocType: "mixed",
+        leagueName: "Football",
         source: "Wikipedia – Football club",
         delay: 1,
       },
       // Other Leagues
       {
         url: "https://en.wikipedia.org/wiki/La_Liga",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "La_Liga",
+        wikiDocType: "mixed",
+        leagueName: "La Liga",
         source: "Wikipedia – La Liga",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Serie_A",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Serie_A",
+        wikiDocType: "mixed",
+        leagueName: "Serie A",
         source: "Wikipedia – Serie A",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Bundesliga",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Bundesliga",
+        wikiDocType: "mixed",
+        leagueName: "Bundesliga",
         source: "Wikipedia – Bundesliga",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/Ligue_1",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "Ligue_1",
+        wikiDocType: "mixed",
+        leagueName: "Ligue 1",
         source: "Wikipedia – Ligue 1",
         delay: 1,
       },
       {
         url: "https://en.wikipedia.org/wiki/UEFA_Champions_League",
-        type: "html",
+        type: "wikipedia-api",
+        wikiTitle: "UEFA_Champions_League",
+        wikiDocType: "mixed",
+        leagueName: "Champions League",
         source: "Wikipedia – Champions League",
         delay: 1,
       },

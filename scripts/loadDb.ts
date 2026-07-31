@@ -22,6 +22,15 @@ import {
   extractHtmlLinks,
   filterBbcTeamLinks,
 } from "./lib/scrapers/htmlScraper.js";
+import {
+  currentSeasonStartYear,
+  fetchEspnStandings,
+  fetchEspnScoreboard,
+  fetchWikipediaArticle,
+  fetchOpenfootball,
+  fetchFootballDataOrg,
+  fetchApiFootball,
+} from "./lib/scrapers/apiFetchers.js";
 import { extractRssLinks } from "./lib/scrapers/rssScraper.js";
 import { isLowValueContent } from "./lib/scrapers/contentFilter.js";
 import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
@@ -58,6 +67,20 @@ import type { SourceItem } from "./lib/config/dataSources.js";
 // so gating on docMeta.league alone can never surface AFCON. These URL
 // patterns (soccerway, BBC, Wikipedia variants) are the only reliable signal.
 const AFCON_URL_RE = /africa-cup-of-nations|afcon/i;
+
+// API source types dispatch to scripts/lib/scrapers/apiFetchers.ts fetchers
+// instead of the HTML/RSS scraper path. Their "url" field is a display-only
+// string built from the same endpoint the fetcher itself calls — it is never
+// passed to isBlocked/isLikelyHtml (see the per-URL guard below), since those
+// heuristics are tuned for scraped HTML pages and would otherwise reject
+// every .json/.api URL these sources use.
+const API_SOURCE_TYPES = new Set<SourceItem["type"]>([
+  "espn-api",
+  "wikipedia-api",
+  "openfootball",
+  "football-data-api",
+  "api-football",
+]);
 
 const pickMostCommon = (counts: Map<string, number>): string | undefined => {
   let best: string | undefined;
@@ -138,8 +161,42 @@ const processDataSources = async (
   // sanity assertion against recordsAdded (see BLOCKER 5 mitigation).
   let attemptedRecords = 0;
 
+  // KEY-GATED source types: an absent key means every entry of that type is
+  // skipped. Logged ONCE per run here (not per URL) so a missing key doesn't
+  // spam the log once per skipped source.
+  const footballDataApiKey = config.FOOTBALL_DATA_API_KEY;
+  const apiFootballKey = config.API_FOOTBALL_KEY;
+  const footballDataApiCount = queue.filter((item) => item.type === "football-data-api").length;
+  const apiFootballCount = queue.filter((item) => item.type === "api-football").length;
+  if (!footballDataApiKey && footballDataApiCount > 0) {
+    console.log(
+      `[sources] FOOTBALL_DATA_API_KEY not set — skipping ${footballDataApiCount} football-data.org sources`,
+    );
+  }
+  if (!apiFootballKey && apiFootballCount > 0) {
+    console.log(
+      `[sources] API_FOOTBALL_KEY not set — skipping ${apiFootballCount} api-football sources`,
+    );
+  }
+
   for (let i = 0; i < queue.length; i += 1) {
-    const { url, type, source, delay = 2, category = "unknown", formMode, formMatches } = queue[i];
+    const {
+      url,
+      type,
+      source,
+      delay = 2,
+      category = "unknown",
+      formMode,
+      formMatches,
+      leagueName,
+      leagueCode,
+      espnEndpoint,
+      wikiTitle,
+      wikiDocType,
+      leaguePath,
+      competitionCode,
+      apiLeagueId,
+    } = queue[i];
     const baseTotal = queue.length;
     const capLabel = maxUrls !== undefined ? ` cap=${maxUrls}` : "";
     console.log(
@@ -196,9 +253,23 @@ const processDataSources = async (
       continue;
     }
 
-    if (isBlocked(url) || !isLikelyHtml(url)) {
+    const isApiSource = API_SOURCE_TYPES.has(type);
+
+    if (!isApiSource && (isBlocked(url) || !isLikelyHtml(url))) {
       skippedUrls += 1;
       console.log(`Skipped ${url} (blocked or non-html)`);
+      continue;
+    }
+
+    // KEY-GATED types with no key configured: skip without calling the
+    // fetcher. The one-line-per-run warning above already explained why.
+    if (
+      (type === "football-data-api" && !footballDataApiKey) ||
+      (type === "api-football" && !apiFootballKey)
+    ) {
+      skippedUrls += 1;
+      console.log(`Skipped ${url} (API key not set)`);
+      await sleep(delay);
       continue;
     }
 
@@ -216,6 +287,28 @@ const processDataSources = async (
         }
         if (type === "soccerway_lineups") {
           return scrapeSoccerwayLineupsPage(url);
+        }
+        if (type === "espn-api") {
+          return espnEndpoint === "scoreboard"
+            ? fetchEspnScoreboard(leagueCode ?? "", leagueName ?? "")
+            : fetchEspnStandings(leagueCode ?? "", leagueName ?? "");
+        }
+        if (type === "wikipedia-api") {
+          return fetchWikipediaArticle(wikiTitle ?? "", leagueName ?? "", wikiDocType ?? "mixed");
+        }
+        if (type === "openfootball") {
+          return fetchOpenfootball(leaguePath ?? "", leagueName ?? "", currentSeasonStartYear());
+        }
+        if (type === "football-data-api") {
+          return fetchFootballDataOrg(competitionCode ?? "", leagueName ?? "", footballDataApiKey ?? "");
+        }
+        if (type === "api-football") {
+          return fetchApiFootball(
+            apiLeagueId ?? 0,
+            leagueName ?? "",
+            currentSeasonStartYear(),
+            apiFootballKey ?? "",
+          );
         }
         return scrapPage(url, type);
       },

@@ -15,6 +15,8 @@ export interface EnvConfig {
   EPL_TEAMS_ENABLED: string | undefined;
   SCRAPE_MATCH_DETAILS: string | undefined; // queue reportUrl + lineupsUrl from Soccerway results
   SOURCE_FILTER: string | undefined; // comma-separated domain/name filter e.g. "bbc,understat"
+  FOOTBALL_DATA_API_KEY: string | undefined; // football-data.org v4 API key — key-gated sources skip when absent
+  API_FOOTBALL_KEY: string | undefined; // api-football (api-sports.io) v3 key — key-gated sources skip when absent
   STATS_CHUNK_SIZE: number;
   STATS_CHUNK_OVERLAP: number;
   DEFAULT_CHUNK_SIZE: number;
@@ -129,6 +131,10 @@ export const loadEnvConfig = (): EnvConfig => {
     EPL_TEAMS_ENABLED: process.env.EPL_TEAMS_ENABLED,
     SCRAPE_MATCH_DETAILS: process.env.SCRAPE_MATCH_DETAILS,
     SOURCE_FILTER: process.env.SOURCE_FILTER,
+    // Optional — key-gated sources (football-data-api, api-football) skip
+    // themselves when these are undefined or empty; no validation failure.
+    FOOTBALL_DATA_API_KEY: process.env.FOOTBALL_DATA_API_KEY || undefined,
+    API_FOOTBALL_KEY: process.env.API_FOOTBALL_KEY || undefined,
     STATS_CHUNK_SIZE: statsChunkSize,
     STATS_CHUNK_OVERLAP: statsChunkOverlap,
     DEFAULT_CHUNK_SIZE: defaultChunkSize,
