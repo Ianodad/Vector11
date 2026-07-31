@@ -62,6 +62,26 @@ const seasonFromStartDate = (startDate: unknown, fallbackSeason: string): string
 // ── Shared plumbing ─────────────────────────────────────────────────────────
 
 /**
+ * Descriptive User-Agent required by Wikimedia's robot policy (and good
+ * etiquette for every other zero-key API here). A cloud CI runner's
+ * datacenter IP with a missing/default UA is Wikimedia's documented failure
+ * mode — requests come back empty or erroring even though the exact same
+ * fetch succeeds from a residential/dev IP. Centralized so every fetchJson
+ * call carries it, not just Wikipedia's.
+ */
+const SEED_USER_AGENT =
+  "vector11-rag-seed/1.0 (https://github.com/Ianodad/Vector11; contact ianodad@gmail.com)";
+
+/** Merged into every fetchJson call (see fetchJson below). Per-call headers
+ * passed by a caller win on key collisions but otherwise add to this set. */
+const DEFAULT_HEADERS: Record<string, string> = {
+  "User-Agent": SEED_USER_AGENT,
+};
+
+const sleepMs = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
  * One shared JSON fetch helper with an AbortController timeout. Never
  * throws — a dead/rate-limited endpoint must not kill a seed run. Callers
  * treat a null return as "no data" and move on.
@@ -74,7 +94,10 @@ export const fetchJson = async <T = unknown>(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { headers, signal: controller.signal });
+    const res = await fetch(url, {
+      headers: { ...DEFAULT_HEADERS, ...headers },
+      signal: controller.signal,
+    });
     if (!res.ok) {
       console.warn(`[apiFetchers] ${url} → HTTP ${res.status}`);
       return null;
@@ -85,6 +108,39 @@ export const fetchJson = async <T = unknown>(
       `[apiFetchers] ${url} failed: ${error instanceof Error ? error.message : String(error)}`,
     );
     return null;
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/**
+ * Same contract as fetchJson but also surfaces the raw HTTP status — needed
+ * only for football-data.org's 429 rate-limit retry below. Kept as a
+ * separate helper (rather than changing fetchJson's return shape) so every
+ * other existing caller's "bare T | null" contract is untouched.
+ */
+const fetchJsonWithStatus = async <T = unknown>(
+  url: string,
+  headers?: Record<string, string>,
+  timeoutMs = 15000,
+): Promise<{ status: number | null; json: T | null }> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      headers: { ...DEFAULT_HEADERS, ...headers },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.warn(`[apiFetchers] ${url} → HTTP ${res.status}`);
+      return { status: res.status, json: null };
+    }
+    return { status: res.status, json: (await res.json()) as T };
+  } catch (error) {
+    console.warn(
+      `[apiFetchers] ${url} failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { status: null, json: null };
   } finally {
     clearTimeout(timer);
   }
@@ -551,7 +607,13 @@ export const fetchWikipediaArticle = async (
   category: string,
 ): Promise<string | null> => {
   const url = `https://en.wikipedia.org/w/api.php?action=parse&page=${encodeURIComponent(title)}&prop=text&format=json&formatversion=2`;
-  const json = await fetchJson<WikipediaParseResponse>(url);
+  // Wikimedia's API additionally recognizes Api-User-Agent (their REST/action
+  // API convention) alongside the plain User-Agent every fetchJson call
+  // already carries via DEFAULT_HEADERS — belt and suspenders against the
+  // robot-policy rejection.
+  const json = await fetchJson<WikipediaParseResponse>(url, {
+    "Api-User-Agent": SEED_USER_AGENT,
+  });
   const text = json?.parse?.text;
   if (!text) return null;
   return safeConvert("wikipediaHtmlToMarkdown", () =>
@@ -615,8 +677,22 @@ export const openfootballToMarkdown = (
       "",
       `> **Type:** ${type}  |  **League:** ${leagueName}  |  **Season:** ${season}`,
       "",
-      "| Date | Home | Away | Result |",
-      "|:-----|:-----|:-----|:-------|",
+      // "Score" (not "Result") deliberately — the chunker splits each round's
+      // table off into its own chunk with only the header/separator/rows (no
+      // heading, no **Type:** line), and that header is repeated on every
+      // continuation piece. isLowValueContent's lenient stats-content branch
+      // needs a keyword match (goal|assist|match|team|player|score|stat|
+      // table|league|position|points|win|draw|loss) to short-circuit before
+      // its incidental-substring boilerplate-count path — "score" guarantees
+      // that on every table piece regardless of which teams happen to be
+      // playing. Without it, a table's fate rides on team-name luck: e.g. the
+      // literal "Home" header column (itself a BOILERPLATE_PATTERNS entry)
+      // plus incidental hits like "live" inside "Liverpool" or "ht" inside
+      // "Brighton" pushed the EPL matchday table over the 3-match boilerplate
+      // threshold while that same day's La Liga table (different team names)
+      // stayed under it — the live-reproduced root cause of the en.1 gap.
+      "| Date | Home | Away | Score |",
+      "|:-----|:-----|:-----|:------|",
     ];
     for (const m of roundMatches) {
       const sc = extractOpenfootballScore(m.score);
@@ -826,6 +902,67 @@ export const footballDataOrgScorersToMarkdown = (
   return lines.join("\n");
 };
 
+// ── football-data.org pacing + 429 retry ────────────────────────────────────
+// Free tier is 10 requests/min. Six competitions fetched back-to-back
+// (~3 calls each) blow through that in seconds — requests 11+ came back
+// 429/empty, silently skipping whichever competitions landed last (FL1, CL
+// in the first live seed run). Every football-data.org request now (a)
+// waits for a shared pacing gate before firing, and (b) on an explicit 429
+// response waits 65s and retries exactly once before giving up.
+
+const FOOTBALL_DATA_ORG_MIN_INTERVAL_MS = 6500;
+
+let footballDataLastCallAt = 0;
+// Serializes callers behind a promise chain so concurrent/rapid calls queue
+// up strictly in order rather than racing to read a stale lastCallAt.
+let footballDataPaceChain: Promise<void> = Promise.resolve();
+
+/**
+ * Resolves once at least `intervalMs` has elapsed since the previous call
+ * resolved. Exported (with an injectable interval) purely so validateSources
+ * can assert the pacing behavior on a short interval instead of the real
+ * 6.5s — production callers rely on the default.
+ */
+export const paceFootballData = (
+  intervalMs: number = FOOTBALL_DATA_ORG_MIN_INTERVAL_MS,
+): Promise<void> => {
+  const turn = footballDataPaceChain.then(async () => {
+    const elapsed = Date.now() - footballDataLastCallAt;
+    const wait = Math.max(0, intervalMs - elapsed);
+    if (wait > 0) await sleepMs(wait);
+    footballDataLastCallAt = Date.now();
+  });
+  // Keep the chain alive even if a turn somehow throws (sleepMs/Date.now
+  // never do, but this is cheap insurance against wedging every future call).
+  footballDataPaceChain = turn.catch(() => undefined);
+  return turn;
+};
+
+/**
+ * Paced football-data.org JSON fetch with a one-time 429 retry: wait 65s
+ * (comfortably past the free tier's 1-minute window) and try exactly once
+ * more, then give up (null) — never retries beyond that one attempt.
+ */
+const fetchFootballDataOrgJson = async <T = unknown>(
+  url: string,
+  headers: Record<string, string>,
+): Promise<T | null> => {
+  await paceFootballData();
+  const first = await fetchJsonWithStatus<T>(url, headers);
+  if (first.status !== 429) return first.json;
+
+  console.warn(
+    `[apiFetchers] football-data.org 429 rate-limited on ${url} — waiting 65s and retrying once`,
+  );
+  await sleepMs(65_000);
+  await paceFootballData();
+  const retry = await fetchJsonWithStatus<T>(url, headers);
+  if (retry.status === 429) {
+    console.warn(`[apiFetchers] football-data.org still 429 after retry on ${url} — giving up`);
+  }
+  return retry.json;
+};
+
 /**
  * Standings + top scorers via football-data.org v4. KEY-GATED — do not call
  * until FOOTBALL_DATA_ORG_KEY (or equivalent) exists; there is no key today.
@@ -852,7 +989,7 @@ export const fetchFootballDataOrg = async (
   const headers = { "X-Auth-Token": apiKey };
   const requestedYear = currentSeasonStartYear();
 
-  let standingsJson = await fetchJson(
+  let standingsJson = await fetchFootballDataOrgJson(
     `https://api.football-data.org/v4/competitions/${competitionCode}/standings?season=${requestedYear}`,
     headers,
   );
@@ -862,13 +999,13 @@ export const fetchFootballDataOrg = async (
     console.warn(
       `[apiFetchers] football-data.org ${competitionCode} season=${requestedYear} not started — falling back to season=${settledYear}`,
     );
-    standingsJson = await fetchJson(
+    standingsJson = await fetchFootballDataOrgJson(
       `https://api.football-data.org/v4/competitions/${competitionCode}/standings?season=${settledYear}`,
       headers,
     );
   }
 
-  const scorersJson = await fetchJson(
+  const scorersJson = await fetchFootballDataOrgJson(
     `https://api.football-data.org/v4/competitions/${competitionCode}/scorers?season=${settledYear}`,
     headers,
   );
