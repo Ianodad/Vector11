@@ -15,9 +15,11 @@ import {
   footballDataOrgScorersToMarkdown,
   isStandingsNotStarted,
   apiFootballStandingsToMarkdown,
+  paceFootballData,
 } from "./lib/scrapers/apiFetchers.js";
 import { normalizeLeagueName } from "./lib/utils/promptGenerator.js";
 import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
+import { isLowValueContent } from "./lib/scrapers/contentFilter.js";
 
 type Failures = string[];
 
@@ -528,6 +530,101 @@ const runOpenfootballTest = (): Failures => {
   if (openfootballToMarkdown({ matches: [] }, "Premier League", "2025/26") !== null) {
     failures.push("openfootball: expected null for empty matches array");
   }
+  return failures;
+};
+
+// ── openfootball en.1 (EPL) — live-reproduced BLOCKER: zero chunks survived
+// (MAJOR finding, seed run 30625125601) ─────────────────────────────────────
+//
+// Root cause (reproduced locally with the real Matchday 1 fixture data):
+// scripts/loadDb.ts's chunker gives each round's table its own chunk — just
+// the "| Date | Home | Away | ... |" header/separator/rows, no heading, no
+// **Type:** line. isLowValueContent's lenient stats-content branch needs a
+// keyword hit (goal|assist|match|team|player|score|stat|table|league|
+// position|points|win|draw|loss) to short-circuit; the old "Result" header
+// carried none, so a ~650-char table fell through to the boilerplate-count
+// path. There it hit >=3 BOILERPLATE_PATTERNS entries by accident: "home"
+// (the literal, guaranteed-present "Home" column header), plus "live"
+// (inside "Liverpool") and "ht" (inside "Brighton") — both incidental
+// substring collisions with that day's specific team names. That same day's
+// La Liga table (different team names) only ever hit "home" — 1 match, safe
+// — which is why the four sibling leagues inserted fine and only en.1 was
+// dropped. The fix renamed the header column to "Score" (a listed stats
+// keyword, repeated on every chunk since packTableRows re-emits the header)
+// so the lenient branch applies unconditionally, independent of which teams
+// happen to be playing.
+const openfootballEplMatchday1Fixture = {
+  matches: [
+    { round: "Matchday 1", date: "2025-08-15", team1: "Liverpool FC", team2: "AFC Bournemouth", score: { ft: [4, 2] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-16", team1: "Aston Villa FC", team2: "Newcastle United FC", score: { ft: [0, 0] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-16", team1: "Brighton & Hove Albion FC", team2: "Fulham FC", score: { ft: [1, 1] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-16", team1: "Sunderland AFC", team2: "West Ham United FC", score: { ft: [3, 0] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-16", team1: "Tottenham Hotspur FC", team2: "Burnley FC", score: { ft: [3, 0] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-16", team1: "Wolverhampton Wanderers FC", team2: "Manchester City FC", score: { ft: [0, 4] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-17", team1: "Nottingham Forest FC", team2: "Brentford FC", score: { ft: [3, 1] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-17", team1: "Chelsea FC", team2: "Crystal Palace FC", score: { ft: [0, 0] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-17", team1: "Manchester United FC", team2: "Arsenal FC", score: { ft: [0, 1] as [number, number] } },
+    { round: "Matchday 1", date: "2025-08-18", team1: "Leeds United FC", team2: "Everton FC", score: { ft: [1, 0] as [number, number] } },
+  ],
+};
+
+const runOpenfootballEplRegressionTest = (): Failures => {
+  const failures: Failures = [];
+  const md = openfootballToMarkdown(openfootballEplMatchday1Fixture, "Premier League", "2025/26");
+  if (!md) {
+    failures.push("openfootball-epl-regression: converter returned null");
+    return failures;
+  }
+
+  // Mirror what the chunker actually isolates into its own chunk: just the
+  // table lines, no heading/type-line prefix.
+  const tableOnly = md
+    .split("\n")
+    .filter((l) => l.startsWith("|"))
+    .join("\n");
+
+  if (isLowValueContent(tableOnly)) {
+    failures.push(
+      "openfootball-epl-regression: EPL matchday table incorrectly classified as low-value content by isLowValueContent — the live-reproduced false positive is back",
+    );
+  }
+  if (!/\bscore\b/i.test(md)) {
+    failures.push(
+      "openfootball-epl-regression: expected the table header to carry a stats keyword (e.g. 'Score') so the isLowValueContent lenient branch applies unconditionally, not by team-name luck",
+    );
+  }
+
+  return failures;
+};
+
+// ── football-data.org pacing gate (paceFootballData) ────────────────────────
+// Free tier is 10 req/min; six competitions fetched back-to-back blew
+// through it. Asserts consecutive calls are spaced by at least the
+// (injectable, kept short here) interval — never the real 6.5s default, so
+// this suite stays fast.
+const runPaceFootballDataTest = async (): Promise<Failures> => {
+  const failures: Failures = [];
+  const intervalMs = 40;
+
+  const start = Date.now();
+  await paceFootballData(intervalMs);
+  const afterFirst = Date.now();
+  await paceFootballData(intervalMs);
+  const afterSecond = Date.now();
+
+  const elapsed = afterSecond - afterFirst;
+  // Small negative tolerance for setTimeout/scheduler jitter.
+  if (elapsed < intervalMs - 5) {
+    failures.push(
+      `paceFootballData: expected >= ~${intervalMs}ms between consecutive calls, got ${elapsed}ms`,
+    );
+  }
+  if (afterFirst - start > intervalMs * 5) {
+    failures.push(
+      `paceFootballData: first call took unexpectedly long (${afterFirst - start}ms) — pacing state may not be starting from zero`,
+    );
+  }
+
   return failures;
 };
 
@@ -1106,10 +1203,10 @@ const runIsStatsSiteTest = (): Failures => {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-const main = (): void => {
+const main = async (): Promise<void> => {
   const allFailures: Failures = [];
 
-  const suites: Array<[string, () => Failures]> = [
+  const suites: Array<[string, () => Failures | Promise<Failures>]> = [
     ["season-helpers", runSeasonHelperTests],
     ["espn-standings", runEspnStandingsTest],
     ["espn-scoreboard", runEspnScoreboardTest],
@@ -1118,15 +1215,17 @@ const main = (): void => {
     ["wikipedia-rowspan-colspan", runWikipediaRowspanColspanTest],
     ["wikipedia-malformed-table", runWikipediaMalformedTableTest],
     ["openfootball", runOpenfootballTest],
+    ["openfootball-epl-regression", runOpenfootballEplRegressionTest],
     ["football-data-org", runFootballDataOrgTest],
     ["football-data-org-not-started-fallback", runIsStandingsNotStartedTest],
+    ["football-data-org-pacing", runPaceFootballDataTest],
     ["api-football", runApiFootballTest],
     ["normalize-league-name-caf", runNormalizeLeagueNameCafTest],
     ["is-stats-site", runIsStatsSiteTest],
   ];
 
   for (const [name, run] of suites) {
-    const failures = run();
+    const failures = await run();
     if (failures.length === 0) {
       console.log(`[PASS] ${name}`);
     } else {
