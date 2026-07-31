@@ -151,6 +151,7 @@ export const LEAGUE_DISPLAY_TO_CODE: Record<string, string> = {
   "europa league": "Europa League",
   "uefa europa league": "Europa League",
   afcon: "AFCON",
+  "caf champions league": "CAF Champions League",
 };
 
 export const normalizeLeagueName = (raw: string): string => {

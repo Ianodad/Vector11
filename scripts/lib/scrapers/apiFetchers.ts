@@ -69,6 +69,24 @@ export const fetchJson = async <T = unknown>(
   }
 };
 
+/**
+ * Wraps a pure converter's call in try/catch — mechanically enforces every
+ * exported fetch* function's "never throws" contract even if a converter
+ * has a gap in its own defensive coding against a malformed upstream
+ * response shape. Warns and returns null rather than letting the error
+ * propagate and kill a seed run.
+ */
+const safeConvert = <T>(label: string, convert: () => T | null): T | null => {
+  try {
+    return convert();
+  } catch (error) {
+    console.warn(
+      `[apiFetchers] ${label} threw: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return null;
+  }
+};
+
 const HOUSE_TABLE_HEADER =
   "| Pos | Team | MP | W | D | L | GF | GA | GD | Pts |";
 const HOUSE_TABLE_SEP =
@@ -142,7 +160,7 @@ export const fetchEspnStandings = async (
     `https://site.api.espn.com/apis/v2/sports/soccer/${leagueCode}/standings`,
   );
   if (!json) return null;
-  return espnStandingsToMarkdown(json, leagueName, season);
+  return safeConvert("espnStandingsToMarkdown", () => espnStandingsToMarkdown(json, leagueName, season));
 };
 
 interface EspnCompetitor {
@@ -223,7 +241,7 @@ export const fetchEspnScoreboard = async (
     `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueCode}/scoreboard`,
   );
   if (!json) return null;
-  return espnScoreboardToMarkdown(json, leagueName, season);
+  return safeConvert("espnScoreboardToMarkdown", () => espnScoreboardToMarkdown(json, leagueName, season));
 };
 
 // ── Wikipedia MediaWiki API (no key) ────────────────────────────────────────
@@ -295,27 +313,106 @@ const cleanCellText = (cellHtml: string): string => {
 
 const MAX_TABLE_ROWS = 60;
 
+// One-line placeholder emitted instead of a table whose rowspan/colspan
+// layout the grid model below can't expand safely — shipping a table with
+// positionally-shifted cells is worse than omitting it.
+const TABLE_OMITTED_NOTE = "*[table omitted: complex layout]*";
+
+// Cap on any single rowspan/colspan value — defends against pathological or
+// malformed markup (e.g. rowspan="999") turning into a huge/slow grid.
+const MAX_SPAN = 100;
+
+interface WikiCell {
+  text: string;
+  rowspan: number;
+  colspan: number;
+}
+
+const parseSpanAttr = (attrs: string, name: "rowspan" | "colspan"): number => {
+  const match = attrs.match(new RegExp(`${name}\\s*=\\s*["']?(\\d+)`, "i"));
+  const n = match ? Number(match[1]) : 1;
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, MAX_SPAN);
+};
+
+/** Extracts a <tr>'s cells with their rowspan/colspan, in document order. */
+const parseRowCells = (rowInnerHtml: string): WikiCell[] =>
+  [...rowInnerHtml.matchAll(/<t[dh]\b([^>]*)>([\s\S]*?)<\/t[dh]>/gi)].map((m) => ({
+    text: cleanCellText(m[2]),
+    rowspan: parseSpanAttr(m[1], "rowspan"),
+    colspan: parseSpanAttr(m[1], "colspan"),
+  }));
+
+/**
+ * Expands raw <tr> cell lists into a full grid, resolving rowspan/colspan so
+ * a rowspanned cell's text is REPEATED into the same column of every
+ * following row it spans, and a colspanned cell is repeated across the
+ * columns it covers — instead of the naive per-<tr> extraction where a
+ * rowspanned label cell vanishes and every subsequent cell on that row
+ * silently shifts left.
+ *
+ * Walks each row column-by-column: at each column, an active carry-over
+ * (from an earlier row's rowspan) is placed first; otherwise the next actual
+ * cell in the row is placed (repeated across its colspan). Returns null when
+ * the resulting rows don't all end up the same width — a layout this model
+ * can't represent without risking a positional shift — so the caller can
+ * skip the table entirely rather than ship shifted data.
+ */
+const expandTableGrid = (rows: WikiCell[][]): string[][] | null => {
+  const carry = new Map<number, { text: string; remaining: number }>();
+  const grid: string[][] = [];
+
+  for (const rowCells of rows) {
+    const rowArr: string[] = [];
+    let col = 0;
+    let cellIdx = 0;
+    while (cellIdx < rowCells.length || carry.has(col)) {
+      const active = carry.get(col);
+      if (active) {
+        rowArr[col] = active.text;
+        active.remaining -= 1;
+        if (active.remaining <= 0) carry.delete(col);
+        col += 1;
+        continue;
+      }
+      const cell = rowCells[cellIdx];
+      // A colspanned cell must not overwrite a column an earlier rowspan is
+      // still carrying into — that's a layout this model can't reconcile.
+      for (let k = 0; k < cell.colspan; k += 1) {
+        if (carry.has(col + k)) return null;
+      }
+      for (let k = 0; k < cell.colspan; k += 1) {
+        rowArr[col + k] = cell.text;
+        if (cell.rowspan > 1) {
+          carry.set(col + k, { text: cell.text, remaining: cell.rowspan - 1 });
+        }
+      }
+      col += cell.colspan;
+      cellIdx += 1;
+    }
+    grid.push(rowArr);
+  }
+
+  const width = grid.length > 0 ? Math.max(...grid.map((r) => r.length)) : 0;
+  if (width === 0 || grid.some((r) => r.length !== width)) return null;
+  return grid;
+};
+
 const tableInnerToMarkdown = (inner: string): string | null => {
   const rowMatches = [...inner.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)];
   if (rowMatches.length === 0) return null;
 
-  const rows: string[][] = [];
-  for (const rowMatch of rowMatches.slice(0, MAX_TABLE_ROWS + 1)) {
-    const cellMatches = [...rowMatch[1].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi)];
-    if (cellMatches.length === 0) continue;
-    rows.push(cellMatches.map((c) => cleanCellText(c[1])));
-  }
-  if (rows.length === 0) return null;
+  const rawRows = rowMatches
+    .slice(0, MAX_TABLE_ROWS + 1)
+    .map((m) => parseRowCells(m[1]))
+    .filter((cells) => cells.length > 0);
+  if (rawRows.length === 0) return null;
 
-  const width = Math.max(...rows.map((r) => r.length));
-  const pad = (r: string[]): string[] => {
-    const copy = [...r];
-    while (copy.length < width) copy.push("-");
-    return copy;
-  };
+  const grid = expandTableGrid(rawRows);
+  if (grid === null) return TABLE_OMITTED_NOTE;
 
-  const header = pad(rows[0]);
-  const body = rows.slice(1).map(pad);
+  const header = grid[0];
+  const body = grid.slice(1);
   const lines = [
     `| ${header.join(" | ")} |`,
     `|${header.map(() => "---").join("|")}|`,
@@ -356,12 +453,28 @@ const resolveDocType = (category: string): string => {
 };
 
 /**
- * Derives "2025/26" from a title like "2025–26 Premier League" (en-dash or
- * hyphen); falls back to the current season when the title has no year.
+ * Derives "2025/26" from a title. Two patterns, range takes precedence:
+ *   1. A range title like "2025–26 Premier League" (en-dash or hyphen) ->
+ *      seasonString of the range's start year.
+ *   2. A standalone 4-digit year (1900–2100) like "2025 Africa Cup of
+ *      Nations" -> seasonString(year). Single-edition tournaments named for
+ *      the calendar year they start in (AFCON, World Cup) often run into the
+ *      following year, so treating the bare year as a season-start year
+ *      (not the current season) avoids mislabeling e.g. AFCON 2025
+ *      (Dec 2025–Jan 2026) as the season that happens to be current when the
+ *      article is fetched.
+ * Falls back to the current season when the title has no year at all.
  */
 const deriveSeasonFromTitle = (title: string): string => {
-  const match = title.match(/(\d{4})[–-](\d{2})\b/);
-  if (match) return seasonString(Number(match[1]));
+  const rangeMatch = title.match(/(\d{4})[–-](\d{2})\b/);
+  if (rangeMatch) return seasonString(Number(rangeMatch[1]));
+
+  const yearMatch = title.match(/\b(\d{4})\b/);
+  if (yearMatch) {
+    const year = Number(yearMatch[1]);
+    if (year >= 1900 && year <= 2100) return seasonString(year);
+  }
+
   return seasonString(currentSeasonStartYear());
 };
 
@@ -394,7 +507,12 @@ export const wikipediaHtmlToMarkdown = (
   for (const table of tables) parts.push(table, "");
 
   let combined = parts.join("\n").trim() + "\n";
-  if (combined.length > MAX_WIKI_CHARS) combined = combined.slice(0, MAX_WIKI_CHARS);
+  if (combined.length > MAX_WIKI_CHARS) {
+    // Truncate at the last newline at/before the cap instead of a raw slice,
+    // so the cut lands on a line boundary rather than mid markdown-table-row.
+    const lastNewline = combined.lastIndexOf("\n", MAX_WIKI_CHARS);
+    combined = combined.slice(0, lastNewline > 0 ? lastNewline : MAX_WIKI_CHARS);
+  }
   return combined;
 };
 
@@ -411,7 +529,9 @@ export const fetchWikipediaArticle = async (
   const json = await fetchJson<WikipediaParseResponse>(url);
   const text = json?.parse?.text;
   if (!text) return null;
-  return wikipediaHtmlToMarkdown(text, json?.parse?.title ?? title, leagueName, category);
+  return safeConvert("wikipediaHtmlToMarkdown", () =>
+    wikipediaHtmlToMarkdown(text, json?.parse?.title ?? title, leagueName, category),
+  );
 };
 
 // ── openfootball JSON (no key) ──────────────────────────────────────────────
@@ -486,22 +606,50 @@ export const openfootballToMarkdown = (
 };
 
 /**
+ * Candidate season start years to try, in order — the requested startYear
+ * first, then a one-time fallback to the previous season. Factored out as a
+ * pure helper (no fetch) so the rollover decision is directly testable:
+ * right after the July 1st season boundary (see currentSeasonStartYear),
+ * the new season's openfootball file may not exist on GitHub yet, so a 404
+ * for startYear should fall back to startYear - 1 rather than yielding zero
+ * fixture content.
+ */
+export const openfootballCandidateYears = (startYear: number): number[] => [
+  startYear,
+  startYear - 1,
+];
+
+/**
  * Season folder format is "2025-26" (verified against the repo layout —
  * e.g. openfootball/football.json/2025-26/en.1.json). If the file is
  * absent for a given league/season, fetchJson's non-200 handling makes
- * this return null quietly.
+ * this return null quietly — tried in turn via openfootballCandidateYears,
+ * so a startYear 404 (season rollover window) retries startYear - 1 once.
+ * The returned markdown carries whichever season's data it actually is.
  */
 export const fetchOpenfootball = async (
   leaguePath: string,
   leagueName: string,
   startYear: number,
 ): Promise<string | null> => {
-  const seasonFolder = `${startYear}-${String(startYear + 1).slice(-2)}`;
-  const season = seasonString(startYear);
-  const url = `https://raw.githubusercontent.com/openfootball/football.json/master/${seasonFolder}/${leaguePath}.json`;
-  const json = await fetchJson(url);
-  if (!json) return null;
-  return openfootballToMarkdown(json, leagueName, season);
+  const candidates = openfootballCandidateYears(startYear);
+  for (let i = 0; i < candidates.length; i += 1) {
+    const year = candidates[i];
+    const seasonFolder = `${year}-${String(year + 1).slice(-2)}`;
+    const url = `https://raw.githubusercontent.com/openfootball/football.json/master/${seasonFolder}/${leaguePath}.json`;
+    const json = await fetchJson(url);
+    if (!json) {
+      if (i < candidates.length - 1) {
+        console.warn(
+          `[apiFetchers] openfootball ${leaguePath} ${seasonFolder} not found — falling back to previous season`,
+        );
+      }
+      continue;
+    }
+    const season = seasonString(year);
+    return safeConvert("openfootballToMarkdown", () => openfootballToMarkdown(json, leagueName, season));
+  }
+  return null;
 };
 
 // ── football-data.org (KEY-GATED) ───────────────────────────────────────────
@@ -526,60 +674,87 @@ interface FdoTableRow {
 }
 interface FdoStanding {
   type?: string;
-  table: FdoTableRow[];
+  group?: string; // set for group-stage competitions, e.g. Champions League
+  table?: FdoTableRow[];
 }
 interface FdoStandingsResponse {
   standings?: FdoStanding[];
 }
 
-/** Pure converter — no network. Exported so tests can run on fixture JSON. */
+/**
+ * Pure converter — no network. Exported so tests can run on fixture JSON.
+ * Loops ALL standings groups (like the ESPN/API-Football converters do),
+ * emitting one `## <group>` section each, instead of only the first TOTAL
+ * group — a competition like Champions League has multiple groups, all of
+ * which belong in the corpus. Defensive against malformed rows (missing
+ * `team.name`): skip with a warn rather than throwing/emitting "undefined".
+ */
 export const footballDataOrgStandingsToMarkdown = (
   json: unknown,
   leagueName: string,
   season: string,
 ): string | null => {
   const data = json as FdoStandingsResponse;
-  const standings = data.standings ?? [];
-  const total = standings.find((s) => s.type === "TOTAL") ?? standings[0];
-  if (!total || total.table.length === 0) return null;
+  const standings = data?.standings ?? [];
+  const multiGroup = standings.length > 1;
 
-  const lines = [
-    "## Standings",
-    "",
-    `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${season}`,
-    "",
-    HOUSE_TABLE_HEADER,
-    HOUSE_TABLE_SEP,
-  ];
-  for (const row of total.table) {
-    lines.push(
-      `| ${row.position} | ${row.team.name} | ${row.playedGames} | ${row.won} | ${row.draw} | ${row.lost} | ${row.goalsFor} | ${row.goalsAgainst} | ${row.goalDifference} | ${row.points} |`,
-    );
+  const sections: string[] = [];
+  for (const group of standings) {
+    const rows = group?.table ?? [];
+    if (rows.length === 0) continue;
+    const heading = multiGroup ? `## ${group?.group ?? group?.type ?? "Standings"}` : "## Standings";
+    const lines = [
+      heading,
+      "",
+      `> **Type:** Standings  |  **League:** ${leagueName}  |  **Season:** ${season}`,
+      "",
+      HOUSE_TABLE_HEADER,
+      HOUSE_TABLE_SEP,
+    ];
+    let rowCount = 0;
+    for (const row of rows) {
+      const teamName = row?.team?.name;
+      if (!teamName) {
+        console.warn("[apiFetchers] football-data.org standings row missing team.name — row skipped");
+        continue;
+      }
+      rowCount += 1;
+      lines.push(
+        `| ${row.position ?? "-"} | ${teamName} | ${row.playedGames ?? "-"} | ${row.won ?? "-"} | ${row.draw ?? "-"} | ${row.lost ?? "-"} | ${row.goalsFor ?? "-"} | ${row.goalsAgainst ?? "-"} | ${row.goalDifference ?? "-"} | ${row.points ?? "-"} |`,
+      );
+    }
+    if (rowCount > 0) sections.push(lines.join("\n"));
   }
-  return lines.join("\n");
+  if (sections.length === 0) return null;
+
+  return sections.join("\n\n");
 };
 
 interface FdoPlayer {
-  name: string;
+  name?: string;
 }
 interface FdoScorer {
-  player: FdoPlayer;
-  team: FdoTeam;
-  goals: number;
+  player?: FdoPlayer;
+  team?: FdoTeam;
+  goals?: number;
   assists?: number | null;
 }
 interface FdoScorersResponse {
   scorers?: FdoScorer[];
 }
 
-/** Pure converter — no network. Exported so tests can run on fixture JSON. */
+/**
+ * Pure converter — no network. Exported so tests can run on fixture JSON.
+ * Defensive against malformed rows (missing `player.name`/`team.name`): skip
+ * with a warn rather than throwing/emitting "undefined".
+ */
 export const footballDataOrgScorersToMarkdown = (
   json: unknown,
   leagueName: string,
   season: string,
 ): string | null => {
   const data = json as FdoScorersResponse;
-  const scorers = data.scorers ?? [];
+  const scorers = data?.scorers ?? [];
   if (scorers.length === 0) return null;
 
   const lines = [
@@ -590,9 +765,18 @@ export const footballDataOrgScorersToMarkdown = (
     "| # | Player | Team | Goals | Assists |",
     "|--:|:-------|:-----|------:|--------:|",
   ];
-  scorers.forEach((s, i) => {
-    lines.push(`| ${i + 1} | ${s.player.name} | ${s.team.name} | ${s.goals} | ${s.assists ?? 0} |`);
-  });
+  let rank = 0;
+  for (const s of scorers) {
+    const playerName = s?.player?.name;
+    const teamName = s?.team?.name;
+    if (!playerName || !teamName) {
+      console.warn("[apiFetchers] football-data.org scorer row missing player/team name — row skipped");
+      continue;
+    }
+    rank += 1;
+    lines.push(`| ${rank} | ${playerName} | ${teamName} | ${s.goals ?? "-"} | ${s.assists ?? 0} |`);
+  }
+  if (rank === 0) return null;
   return lines.join("\n");
 };
 
@@ -616,11 +800,15 @@ export const fetchFootballDataOrg = async (
 
   const sections: string[] = [];
   if (standingsJson) {
-    const md = footballDataOrgStandingsToMarkdown(standingsJson, leagueName, season);
+    const md = safeConvert("footballDataOrgStandingsToMarkdown", () =>
+      footballDataOrgStandingsToMarkdown(standingsJson, leagueName, season),
+    );
     if (md) sections.push(md);
   }
   if (scorersJson) {
-    const md = footballDataOrgScorersToMarkdown(scorersJson, leagueName, season);
+    const md = safeConvert("footballDataOrgScorersToMarkdown", () =>
+      footballDataOrgScorersToMarkdown(scorersJson, leagueName, season),
+    );
     if (md) sections.push(md);
   }
   if (sections.length === 0) return null;
@@ -634,18 +822,18 @@ export const fetchFootballDataOrg = async (
 // docs; see scripts/validateSources.ts, marked as hand-built there).
 
 interface ApiFootballTeam {
-  name: string;
+  name?: string;
 }
 interface ApiFootballGoals {
-  for: number;
-  against: number;
+  for?: number;
+  against?: number;
 }
 interface ApiFootballStandingEntry {
-  rank: number;
-  team: ApiFootballTeam;
-  points: number;
-  goalsDiff: number;
-  all: { played: number; win: number; draw: number; lose: number; goals: ApiFootballGoals };
+  rank?: number;
+  team?: ApiFootballTeam;
+  points?: number;
+  goalsDiff?: number;
+  all?: { played?: number; win?: number; draw?: number; lose?: number; goals?: ApiFootballGoals };
 }
 interface ApiFootballLeagueBlock {
   league?: { standings?: ApiFootballStandingEntry[][] };
@@ -654,19 +842,23 @@ interface ApiFootballStandingsResponse {
   response?: ApiFootballLeagueBlock[];
 }
 
-/** Pure converter — no network. Exported so tests can run on fixture JSON. */
+/**
+ * Pure converter — no network. Exported so tests can run on fixture JSON.
+ * Defensive against malformed rows (missing `team.name`): skip with a warn
+ * rather than throwing/emitting "undefined".
+ */
 export const apiFootballStandingsToMarkdown = (
   json: unknown,
   leagueName: string,
   season: string,
 ): string | null => {
   const data = json as ApiFootballStandingsResponse;
-  const groups = data.response?.[0]?.league?.standings ?? [];
+  const groups = data?.response?.[0]?.league?.standings ?? [];
   const multiGroup = groups.length > 1;
 
   const sections: string[] = [];
   groups.forEach((group, idx) => {
-    if (group.length === 0) return;
+    if (!group || group.length === 0) return;
     const heading = multiGroup ? `## Group ${idx + 1}` : "## Standings";
     const lines = [
       heading,
@@ -676,12 +868,20 @@ export const apiFootballStandingsToMarkdown = (
       HOUSE_TABLE_HEADER,
       HOUSE_TABLE_SEP,
     ];
+    let rowCount = 0;
     for (const row of group) {
+      const teamName = row?.team?.name;
+      if (!teamName) {
+        console.warn("[apiFetchers] api-football standings row missing team.name — row skipped");
+        continue;
+      }
+      rowCount += 1;
+      const all = row.all;
       lines.push(
-        `| ${row.rank} | ${row.team.name} | ${row.all.played} | ${row.all.win} | ${row.all.draw} | ${row.all.lose} | ${row.all.goals.for} | ${row.all.goals.against} | ${row.goalsDiff} | ${row.points} |`,
+        `| ${row.rank ?? "-"} | ${teamName} | ${all?.played ?? "-"} | ${all?.win ?? "-"} | ${all?.draw ?? "-"} | ${all?.lose ?? "-"} | ${all?.goals?.for ?? "-"} | ${all?.goals?.against ?? "-"} | ${row.goalsDiff ?? "-"} | ${row.points ?? "-"} |`,
       );
     }
-    sections.push(lines.join("\n"));
+    if (rowCount > 0) sections.push(lines.join("\n"));
   });
   if (sections.length === 0) return null;
 
@@ -704,5 +904,7 @@ export const fetchApiFootball = async (
   const url = `https://v3.football.api-sports.io/standings?league=${leagueId}&season=${season}`;
   const json = await fetchJson(url, { "x-apisports-key": apiKey });
   if (!json) return null;
-  return apiFootballStandingsToMarkdown(json, leagueName, seasonLabel);
+  return safeConvert("apiFootballStandingsToMarkdown", () =>
+    apiFootballStandingsToMarkdown(json, leagueName, seasonLabel),
+  );
 };

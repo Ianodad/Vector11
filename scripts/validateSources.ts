@@ -10,11 +10,13 @@ import {
   espnScoreboardToMarkdown,
   wikipediaHtmlToMarkdown,
   openfootballToMarkdown,
+  openfootballCandidateYears,
   footballDataOrgStandingsToMarkdown,
   footballDataOrgScorersToMarkdown,
   apiFootballStandingsToMarkdown,
 } from "./lib/scrapers/apiFetchers.js";
 import { normalizeLeagueName } from "./lib/utils/promptGenerator.js";
+import { isStatsSite } from "./lib/scrapers/evaluators/statsEvaluator.js";
 
 type Failures = string[];
 
@@ -57,6 +59,23 @@ const assertNoUndefinedOrNull = (md: string, failures: Failures, label: string):
     failures.push(`${label}: output contains "undefined"/"null" substring`);
   }
 };
+
+/** Calls `fn`, recording a failure (instead of crashing the whole run) if it
+ * throws — used to prove the "never throws on malformed input" contract. */
+const assertNoThrow = <T>(label: string, fn: () => T, failures: Failures): T | undefined => {
+  try {
+    return fn();
+  } catch (error) {
+    failures.push(`${label}: threw unexpectedly — ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
+};
+
+/** Splits a markdown table row line into its trimmed cell values, e.g.
+ * "| A | B |" -> ["A", "B"] — used to assert a specific cell at a specific
+ * column index rather than just checking column counts. */
+const parseMdRowCells = (line: string): string[] =>
+  line.split("|").slice(1, -1).map((c) => c.trim());
 
 const runHouseFormatChecks = (md: string | null, leagueName: string, label: string): Failures => {
   const failures: Failures = [];
@@ -106,6 +125,14 @@ const runSeasonHelperTests = (): Failures => {
   }
   if (understatSeasonPath(2025) !== "2025") {
     failures.push(`understatSeasonPath(2025) expected "2025", got "${understatSeasonPath(2025)}"`);
+  }
+
+  // openfootball season-rollover fallback: the requested year first, then
+  // exactly one fallback to the previous season (for the July 1st window
+  // where the new season's GitHub file may not exist yet).
+  const candidates = openfootballCandidateYears(2026);
+  if (candidates.length !== 2 || candidates[0] !== 2026 || candidates[1] !== 2025) {
+    failures.push(`openfootballCandidateYears(2026) expected [2026, 2025], got ${JSON.stringify(candidates)}`);
   }
 
   return failures;
@@ -275,6 +302,151 @@ const runWikipediaTest = (): Failures => {
   return failures;
 };
 
+// A standalone 4-digit year (no range) in the title — regression for the
+// MAJOR review finding: "2025 Africa Cup of Nations" was falling through to
+// the CURRENT season instead of resolving via the year in its own title.
+// AFCON 2025 ran Dec 2025–Jan 2026, so it must read "2025/26" regardless of
+// which season happens to be current when the article is fetched.
+const runWikipediaSingleYearTitleTest = (): Failures => {
+  const failures: Failures = [];
+  const html = `<div><p>${"The 2025 Africa Cup of Nations was the 35th edition of the biennial continental championship of Africa.".padEnd(60, ".")}</p><table class="wikitable"><tr><th>Team</th><th>Result</th></tr><tr><td>Nigeria</td><td>Won</td></tr></table></div>`;
+  const md = wikipediaHtmlToMarkdown(html, "2025 Africa Cup of Nations", "AFCON", "results");
+  failures.push(...runHouseFormatChecks(md, "AFCON", "wikipedia-single-year-title"));
+  if (md && !md.includes("2025/26")) {
+    failures.push(
+      `wikipedia-single-year-title: expected season "2025/26" derived from the standalone year "2025", got ${JSON.stringify(md.slice(0, 60))}`,
+    );
+  }
+
+  // Range pattern takes precedence over an embedded standalone year.
+  const precedenceHtml = `<div><p>${"This article covers the modern competition, successor to the old 1999 edition.".padEnd(60, ".")}</p><table class="wikitable"><tr><th>Team</th><th>Result</th></tr><tr><td>Arsenal</td><td>Won</td></tr></table></div>`;
+  const precedenceMd = wikipediaHtmlToMarkdown(precedenceHtml, "2025–26 Premier League", "Premier League", "mixed");
+  failures.push(...runHouseFormatChecks(precedenceMd, "Premier League", "wikipedia-range-precedence"));
+  if (precedenceMd && !precedenceMd.includes("2025/26")) {
+    failures.push("wikipedia-range-precedence: expected range-derived season 2025/26");
+  }
+  if (precedenceMd && precedenceMd.includes("1999/00")) {
+    failures.push(
+      "wikipedia-range-precedence: standalone year 1999 (embedded in body text) incorrectly won over the range in the title",
+    );
+  }
+
+  return failures;
+};
+
+// ── Wikipedia table rowspan/colspan grid expansion (BLOCKER finding) ────────
+//
+// Regression fixture for the live-verified UEFA_Champions_League bug: the
+// old per-<tr> extraction ignored rowspan/colspan, so a rowspanned label
+// cell vanished and every subsequent cell on that row shifted left, padded
+// with a trailing "-". This fixture uses BOTH a colspanned header cell and a
+// rowspanned label cell, matching the qualifying-round access-list shape on
+// the real article (round name spans two rows, "Fixture" spans two columns).
+const rowspanColspanFixtureHtml = `
+<div class="mw-parser-output">
+<table class="wikitable">
+<tr><th>Round</th><th>Teams</th><th colspan="2">Fixture</th></tr>
+<tr><td rowspan="2">First qualifying round</td><td>Team A</td><td>1–0</td><td>Team B</td></tr>
+<tr><td>Team C</td><td>2–2</td><td>Team D</td></tr>
+</table>
+</div>
+`;
+
+const runWikipediaRowspanColspanTest = (): Failures => {
+  const failures: Failures = [];
+  const md = wikipediaHtmlToMarkdown(
+    rowspanColspanFixtureHtml,
+    "2025–26 UEFA Champions League",
+    "Champions League",
+    "standings",
+  );
+  if (!md) {
+    failures.push("wikipedia-rowspan-colspan: converter returned null");
+    return failures;
+  }
+
+  const lines = md.split("\n");
+  const headerLine = lines.find((l) => l.startsWith("| Round |"));
+  const row1Line = lines.find((l) => l.includes("Team A"));
+  const row2Line = lines.find((l) => l.includes("Team C"));
+
+  if (!headerLine) {
+    failures.push("wikipedia-rowspan-colspan: expected header row starting '| Round |' not found");
+  } else {
+    const cells = parseMdRowCells(headerLine);
+    if (cells[2] !== "Fixture" || cells[3] !== "Fixture") {
+      failures.push(
+        `wikipedia-rowspan-colspan: colspan header expected "Fixture" at cols 2 and 3, got ${JSON.stringify(cells.slice(2))}`,
+      );
+    }
+  }
+
+  if (!row1Line) {
+    failures.push("wikipedia-rowspan-colspan: expected data row containing 'Team A' not found");
+  } else {
+    const cells = parseMdRowCells(row1Line);
+    if (cells[0] !== "First qualifying round") {
+      failures.push(
+        `wikipedia-rowspan-colspan: row 1 col 0 expected "First qualifying round", got ${JSON.stringify(cells[0])}`,
+      );
+    }
+    if (cells[1] !== "Team A") {
+      failures.push(`wikipedia-rowspan-colspan: row 1 col 1 expected "Team A", got ${JSON.stringify(cells[1])}`);
+    }
+  }
+
+  if (!row2Line) {
+    failures.push("wikipedia-rowspan-colspan: expected data row containing 'Team C' not found");
+  } else {
+    const cells = parseMdRowCells(row2Line);
+    // The critical regression assertion: the rowspanned label must be
+    // REPEATED into row 2's column 0 — not vanished, with row 2's real
+    // cells shifted left and padded with a trailing "-" (the old bug).
+    if (cells[0] !== "First qualifying round") {
+      failures.push(
+        `wikipedia-rowspan-colspan: row 2 col 0 expected rowspan label "First qualifying round" repeated, got ${JSON.stringify(cells[0])} — indicates the vanish-and-shift bug`,
+      );
+    }
+    if (cells[1] !== "Team C") {
+      failures.push(`wikipedia-rowspan-colspan: row 2 col 1 expected "Team C" (not shifted), got ${JSON.stringify(cells[1])}`);
+    }
+    if (cells[3] !== "Team D") {
+      failures.push(`wikipedia-rowspan-colspan: row 2 col 3 expected "Team D", got ${JSON.stringify(cells[3])}`);
+    }
+  }
+
+  return failures;
+};
+
+// A table whose rowspan/colspan layout can't be reconciled into an
+// equal-width grid (here: a rowspan cell plus a later colspan cell that
+// together produce mismatched row widths) must be SKIPPED with the
+// omitted-table note rather than shipping positionally-shifted data.
+const malformedTableFixtureHtml = `
+<div class="mw-parser-output">
+<table class="wikitable">
+<tr><td rowspan="2">A</td><td>B</td></tr>
+<tr><td colspan="2">C</td></tr>
+</table>
+</div>
+`;
+
+const runWikipediaMalformedTableTest = (): Failures => {
+  const failures: Failures = [];
+  const md = wikipediaHtmlToMarkdown(malformedTableFixtureHtml, "Malformed Table Title", "EPL", "mixed");
+  if (!md) {
+    failures.push("wikipedia-malformed-table: expected non-null output (the omitted-table note is itself content)");
+    return failures;
+  }
+  if (!md.includes("[table omitted: complex layout]")) {
+    failures.push("wikipedia-malformed-table: expected the table to be omitted with a one-line note, it was not skipped");
+  }
+  if (/\|\s*A\s*\|/.test(md) || /\|\s*C\s*\|/.test(md)) {
+    failures.push("wikipedia-malformed-table: malformed table's shifted cell data leaked into output instead of being omitted");
+  }
+  return failures;
+};
+
 // ── openfootball ─────────────────────────────────────────────────────────────
 
 const openfootballFixture = {
@@ -374,6 +546,93 @@ const fdoScorersFixture = {
   ],
 };
 
+// Malformed-row fixtures (null team / missing player) — regression for the
+// MAJOR review finding: these converters used to dereference nested fields
+// (row.team.name, s.player.name) without optional chaining and would throw
+// on a shape like this, killing a seed run.
+const fdoMalformedStandingsFixture = {
+  standings: [
+    {
+      type: "TOTAL",
+      table: [
+        {
+          position: 1,
+          team: { name: "Arsenal FC" },
+          playedGames: 10,
+          won: 7,
+          draw: 2,
+          lost: 1,
+          points: 23,
+          goalsFor: 20,
+          goalsAgainst: 8,
+          goalDifference: 12,
+        },
+        {
+          position: 2,
+          team: null,
+          playedGames: 10,
+          won: 6,
+          draw: 3,
+          lost: 1,
+          points: 21,
+          goalsFor: 18,
+          goalsAgainst: 9,
+          goalDifference: 9,
+        },
+      ],
+    },
+  ],
+};
+
+const fdoMalformedScorersFixture = {
+  scorers: [
+    { player: { name: "Erling Haaland" }, team: { name: "Manchester City FC" }, goals: 12, assists: 3 },
+    { player: null, team: { name: "Liverpool FC" }, goals: 10, assists: 5 },
+  ],
+};
+
+// Multi-group fixture — regression for the MAJOR review finding: the
+// converter used to render only the first TOTAL group; a competition like
+// Champions League has multiple groups, all of which must appear.
+const fdoMultiGroupStandingsFixture = {
+  standings: [
+    {
+      group: "Group A",
+      table: [
+        {
+          position: 1,
+          team: { name: "Team Alpha" },
+          playedGames: 6,
+          won: 4,
+          draw: 1,
+          lost: 1,
+          points: 13,
+          goalsFor: 10,
+          goalsAgainst: 5,
+          goalDifference: 5,
+        },
+      ],
+    },
+    {
+      group: "Group B",
+      table: [
+        {
+          position: 1,
+          team: { name: "Team Beta" },
+          playedGames: 6,
+          won: 5,
+          draw: 0,
+          lost: 1,
+          points: 15,
+          goalsFor: 12,
+          goalsAgainst: 4,
+          goalDifference: 8,
+        },
+      ],
+    },
+  ],
+};
+
 const runFootballDataOrgTest = (): Failures => {
   const standingsMd = footballDataOrgStandingsToMarkdown(fdoStandingsFixture, "Premier League", "2025/26");
   const scorersMd = footballDataOrgScorersToMarkdown(fdoScorersFixture, "Premier League", "2025/26");
@@ -393,6 +652,53 @@ const runFootballDataOrgTest = (): Failures => {
   if (footballDataOrgScorersToMarkdown({ scorers: [] }, "Premier League", "2025/26") !== null) {
     failures.push("football-data-org-scorers: expected null for empty scorers array");
   }
+
+  const malformedStandingsMd = assertNoThrow(
+    "football-data-org-standings-malformed",
+    () => footballDataOrgStandingsToMarkdown(fdoMalformedStandingsFixture, "Premier League", "2025/26"),
+    failures,
+  );
+  if (malformedStandingsMd) {
+    if (!malformedStandingsMd.includes("Arsenal FC")) {
+      failures.push("football-data-org-standings-malformed: valid row (Arsenal FC) was dropped");
+    }
+    if (/\bnull\b/.test(malformedStandingsMd)) {
+      failures.push("football-data-org-standings-malformed: malformed row's null team leaked into output instead of being skipped");
+    }
+  }
+
+  const malformedScorersMd = assertNoThrow(
+    "football-data-org-scorers-malformed",
+    () => footballDataOrgScorersToMarkdown(fdoMalformedScorersFixture, "Premier League", "2025/26"),
+    failures,
+  );
+  if (malformedScorersMd) {
+    if (!malformedScorersMd.includes("Erling Haaland")) {
+      failures.push("football-data-org-scorers-malformed: valid row (Erling Haaland) was dropped");
+    }
+    if (/\bnull\b/.test(malformedScorersMd)) {
+      failures.push("football-data-org-scorers-malformed: malformed row's null player leaked into output instead of being skipped");
+    }
+  }
+
+  const multiGroupMd = assertNoThrow(
+    "football-data-org-standings-multigroup",
+    () => footballDataOrgStandingsToMarkdown(fdoMultiGroupStandingsFixture, "Champions League", "2025/26"),
+    failures,
+  );
+  if (multiGroupMd) {
+    if (!multiGroupMd.includes("## Group A") || !multiGroupMd.includes("## Group B")) {
+      failures.push(
+        "football-data-org-standings-multigroup: expected both '## Group A' and '## Group B' sections (all groups, not just TOTAL)",
+      );
+    }
+    if (!multiGroupMd.includes("Team Alpha") || !multiGroupMd.includes("Team Beta")) {
+      failures.push("football-data-org-standings-multigroup: expected teams from both groups present");
+    }
+  } else {
+    failures.push("football-data-org-standings-multigroup: expected non-null output");
+  }
+
   return failures;
 };
 
@@ -428,6 +734,38 @@ const apiFootballFixture = {
   ],
 };
 
+// Malformed-row fixture (null team) — regression for the MAJOR review
+// finding: dereferencing row.team.name without optional chaining threw on
+// a shape like this.
+const apiFootballMalformedFixture = {
+  response: [
+    {
+      league: {
+        id: 39,
+        name: "Premier League",
+        standings: [
+          [
+            {
+              rank: 1,
+              team: { name: "Manchester City" },
+              points: 23,
+              goalsDiff: 12,
+              all: { played: 10, win: 7, draw: 2, lose: 1, goals: { for: 20, against: 8 } },
+            },
+            {
+              rank: 2,
+              team: null,
+              points: 21,
+              goalsDiff: 9,
+              all: { played: 10, win: 6, draw: 3, lose: 1, goals: { for: 18, against: 9 } },
+            },
+          ],
+        ],
+      },
+    },
+  ],
+};
+
 const runApiFootballTest = (): Failures => {
   const md = apiFootballStandingsToMarkdown(apiFootballFixture, "Premier League", "2025/26");
   const failures = runHouseFormatChecks(md, "Premier League", "api-football-standings");
@@ -436,6 +774,64 @@ const runApiFootballTest = (): Failures => {
   }
   if (apiFootballStandingsToMarkdown({ response: [] }, "Premier League", "2025/26") !== null) {
     failures.push("api-football-standings: expected null for empty response array");
+  }
+
+  const malformedMd = assertNoThrow(
+    "api-football-standings-malformed",
+    () => apiFootballStandingsToMarkdown(apiFootballMalformedFixture, "Premier League", "2025/26"),
+    failures,
+  );
+  if (malformedMd) {
+    if (!malformedMd.includes("Manchester City")) {
+      failures.push("api-football-standings-malformed: valid row (Manchester City) was dropped");
+    }
+    if (/\bnull\b/.test(malformedMd)) {
+      failures.push("api-football-standings-malformed: malformed row's null team leaked into output instead of being skipped");
+    }
+  }
+
+  return failures;
+};
+
+// ── normalizeLeagueName: CAF Champions League (MINOR finding) ──────────────
+
+const runNormalizeLeagueNameCafTest = (): Failures => {
+  const failures: Failures = [];
+  // Regression: dataSources.ts's api-football CAF entry sets
+  // leagueName: "CAF Champions League" — it must map to itself (a known
+  // code) rather than falling through unmapped.
+  const mapped = normalizeLeagueName("CAF Champions League");
+  if (mapped !== "CAF Champions League") {
+    failures.push(`normalizeLeagueName("CAF Champions League") expected "CAF Champions League", got ${JSON.stringify(mapped)}`);
+  }
+  const mappedLower = normalizeLeagueName("caf champions league");
+  if (mappedLower !== "CAF Champions League") {
+    failures.push(`normalizeLeagueName("caf champions league") expected "CAF Champions League", got ${JSON.stringify(mappedLower)}`);
+  }
+  return failures;
+};
+
+// ── isStatsSite: API stats sources get STATS_CHUNK_SIZE (MINOR finding) ────
+//
+// loadDb.ts calls isStatsSite(url) with the SourceItem.url straight from
+// dataSources.ts (see scripts/lib/scrapers/evaluators/statsEvaluator.ts for
+// the verified call-path note) — so matching these hosts is what actually
+// routes the espn-api/football-data-api/api-football standings entries onto
+// STATS_CHUNK_SIZE like Understat.
+const runIsStatsSiteTest = (): Failures => {
+  const failures: Failures = [];
+  const cases: Array<[string, boolean]> = [
+    ["https://site.api.espn.com/apis/v2/sports/soccer/eng.1/standings", true],
+    ["https://api.football-data.org/v4/competitions/PL/standings", true],
+    ["https://v3.football.api-sports.io/standings?league=6", true],
+    ["https://understat.com/league/EPL", true],
+    ["https://www.bbc.com/sport/football", false],
+  ];
+  for (const [url, expected] of cases) {
+    const actual = isStatsSite(url);
+    if (actual !== expected) {
+      failures.push(`isStatsSite(${JSON.stringify(url)}) expected ${expected}, got ${actual}`);
+    }
   }
   return failures;
 };
@@ -450,9 +846,14 @@ const main = (): void => {
     ["espn-standings", runEspnStandingsTest],
     ["espn-scoreboard", runEspnScoreboardTest],
     ["wikipedia", runWikipediaTest],
+    ["wikipedia-single-year-title", runWikipediaSingleYearTitleTest],
+    ["wikipedia-rowspan-colspan", runWikipediaRowspanColspanTest],
+    ["wikipedia-malformed-table", runWikipediaMalformedTableTest],
     ["openfootball", runOpenfootballTest],
     ["football-data-org", runFootballDataOrgTest],
     ["api-football", runApiFootballTest],
+    ["normalize-league-name-caf", runNormalizeLeagueNameCafTest],
+    ["is-stats-site", runIsStatsSiteTest],
   ];
 
   for (const [name, run] of suites) {
