@@ -53,4 +53,10 @@ jobs:
           EPL_TEAMS_ENABLED: ${{ vars.EPL_TEAMS_ENABLED || 'false' }}
           EPL_TEAM_PAGES: ${{ vars.EPL_TEAM_PAGES || '1' }}
           MAX_SCRAPE_URLS: ${{ vars.MAX_SCRAPE_URLS || '' }}
+          # Optional — key-gated sources (football-data-api, api-football)
+          # activate automatically once these secrets exist in repo settings.
+          # An unset GitHub secret resolves to an empty string here, which
+          # env.ts normalizes to `undefined` (key-absent path).
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: npx tsx scripts/loadDb.ts
