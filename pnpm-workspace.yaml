@@ -1,0 +1,10 @@
+packages:
+  - "."
+
+# pnpm 11 blocks dependency build scripts unless approved here.
+# puppeteer's postinstall downloads Chrome for the seed workflow.
+allowBuilds:
+  esbuild: true
+  puppeteer: true
+  sharp: true
+  unrs-resolver: true
