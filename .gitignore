@@ -42,3 +42,9 @@ yarn-error.log*
 next-env.d.ts
 CLAUDE.md
 scripts/logs/*
+
+# local scratch (keeps the auto-backup hook from committing it)
+/_*.ts
+/_*.mts
+.planning/
+.claude/settings.local.json

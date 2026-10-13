@@ -2,10 +2,34 @@
 import { useState } from "react";
 import type { ChatMessage } from "../../types/chat";
 
-export const useChat = () => {
+interface UseChatOptions {
+  onDbWaking?: () => void;
+}
+
+const DB_WAKING_FALLBACK =
+  "The stats database is still waking up. Give it a few seconds and ask again.";
+const TIMEOUT_MESSAGE =
+  "That took too long — the database may still be waking up. Try again in a moment.";
+const GENERIC_ERROR =
+  "Something went wrong reaching the RAG service. Try again in a moment.";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Returns the server's JSON body, or null when the body is not JSON (e.g. a Vercel 504 page).
+const readJson = async <T>(response: Response): Promise<T | null> => {
+  try {
+    return (await response.json()) as T;
+  } catch {
+    return null;
+  }
+};
+
+export const useChat = (options?: UseChatOptions) => {
+  const onDbWaking = options?.onDbWaking;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState<string | null>(null);
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -23,8 +47,15 @@ export const useChat = () => {
     setInput("");
     setIsLoading(true);
 
-    try {
-      const response = await fetch("/api/chat", {
+    const addAssistantMessage = (content: string) => {
+      setMessages((prev) => [
+        ...prev,
+        { id: crypto.randomUUID(), role: "assistant", content },
+      ]);
+    };
+
+    const send = () =>
+      fetch("/api/chat", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -32,31 +63,60 @@ export const useChat = () => {
         body: JSON.stringify({ messages: outgoingMessages }),
       });
 
-      if (!response.ok) {
-        throw new Error("Failed to fetch a response.");
+    // Turns a successful response into the assistant's answer.
+    const showAnswer = async (response: Response) => {
+      const data = await readJson<{ message?: string }>(response);
+      addAssistantMessage(
+        data?.message?.trim() ||
+          "I couldn't find an answer just yet. Try refining the question.",
+      );
+    };
+
+    try {
+      let response = await send();
+
+      if (response.ok) {
+        await showAnswer(response);
+        return;
       }
 
-      const data = (await response.json()) as { message?: string };
-      const assistantMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content:
-          data.message?.trim() ||
-          "I couldn't find an answer just yet. Try refining the question.",
-      };
-      setMessages((prev) => [...prev, assistantMessage]);
+      const body = await readJson<{ error?: string }>(response);
+      const serverError =
+        typeof body?.error === "string" && body.error ? body.error : null;
+
+      if (response.status === 503) {
+        onDbWaking?.();
+        setLoadingLabel("Database is waking up — retrying…");
+        const retryAfter = Number(response.headers.get("Retry-After")) || 15;
+        await sleep(Math.min(retryAfter, 30) * 1000);
+
+        response = await send();
+        if (response.ok) {
+          await showAnswer(response);
+          return;
+        }
+        const retryBody = await readJson<{ error?: string }>(response);
+        addAssistantMessage(
+          (typeof retryBody?.error === "string" && retryBody.error) ||
+            serverError ||
+            DB_WAKING_FALLBACK,
+        );
+        return;
+      }
+
+      if (serverError) {
+        addAssistantMessage(serverError);
+        return;
+      }
+
+      // Non-JSON body (e.g. Vercel 504 timeout)
+      onDbWaking?.();
+      addAssistantMessage(TIMEOUT_MESSAGE);
     } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content:
-            "Something went wrong reaching the RAG service. Try again in a moment.",
-        },
-      ]);
+      addAssistantMessage(GENERIC_ERROR);
     } finally {
       setIsLoading(false);
+      setLoadingLabel(null);
     }
   };
 
@@ -65,6 +125,7 @@ export const useChat = () => {
     input,
     setInput,
     isLoading,
+    loadingLabel,
     handleSubmit,
   };
 };

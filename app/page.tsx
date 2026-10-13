@@ -7,11 +7,16 @@ import { ChatMessage } from "./components/ChatMessage";
 import { LoadingIndicator } from "./components/LoadingIndicator";
 import { ChatInput } from "./components/ChatInput";
 import { PromptBoard } from "./components/PromptBoard";
+import { DbStatusBanner } from "./components/DbStatusBanner";
 import { useChat } from "./lib/hooks/useChat";
+import { useDbStatus } from "./lib/hooks/useDbStatus";
 import { usePromptRotation } from "./lib/hooks/usePromptRotation";
 
 export default function Home() {
-  const { messages, input, setInput, isLoading, handleSubmit } = useChat();
+  const db = useDbStatus();
+  const { messages, input, setInput, isLoading, loadingLabel, handleSubmit } = useChat({
+    onDbWaking: db.markWaking,
+  });
   const { contextPrompts, refreshPrompts } = usePromptRotation();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -45,6 +50,7 @@ export default function Home() {
                 v11
               </span>
             </div>
+            <DbStatusBanner status={db.status} justWoke={db.justWoke} />
             <div className="flex h-[34rem] flex-col gap-4 overflow-y-auto bg-white p-5 sm:p-6">
               {messages.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-neutral-300 bg-neutral-50 p-5 text-sm text-neutral-700">
@@ -56,7 +62,14 @@ export default function Home() {
                   <ChatMessage key={message.id} message={message} />
                 ))
               )}
-              {isLoading && <LoadingIndicator />}
+              {isLoading && (
+                <LoadingIndicator
+                  label={
+                    loadingLabel ??
+                    (db.status === "waking" ? "Waking up the database" : undefined)
+                  }
+                />
+              )}
               <div ref={messagesEndRef} />
             </div>
             <ChatInput
