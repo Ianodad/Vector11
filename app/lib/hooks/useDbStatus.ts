@@ -10,6 +10,8 @@ const JUST_WOKE_MS = 4000;
 export const useDbStatus = () => {
   const [status, setStatus] = useState<DbStatus>("checking");
   const [justWoke, setJustWoke] = useState(false);
+  // epoch ms when the current waking period began (null when not waking/slow)
+  const [wakingSince, setWakingSince] = useState<number | null>(null);
   const statusRef = useRef<DbStatus>("checking");
   const pollingRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -35,7 +37,11 @@ export const useDbStatus = () => {
     if (unmountedRef.current || runId !== runIdRef.current) return;
     let next: DbStatus = "waking";
     try {
-      const res = await fetch("/api/health", { cache: "no-store" });
+      const res = await fetch("/api/health", {
+        cache: "no-store",
+        // a hung connection must not leave status stuck on "checking"
+        signal: AbortSignal.timeout(12000),
+      });
       if (res.ok) {
         const data = (await res.json()) as { status?: string };
         if (data.status === "ready") next = "ready";
@@ -49,11 +55,13 @@ export const useDbStatus = () => {
     if (next === "ready" || next === "error") {
       pollingRef.current = false;
       wakingSinceRef.current = null;
+      setWakingSince(null);
       update(next);
       return;
     }
 
     wakingSinceRef.current ??= Date.now();
+    setWakingSince(wakingSinceRef.current);
     if (Date.now() - wakingSinceRef.current >= GIVE_UP_MS) {
       pollingRef.current = false;
       update("slow");
@@ -88,10 +96,11 @@ export const useDbStatus = () => {
 
   const markWaking = useCallback(() => {
     if (pollingRef.current) return;
-    wakingSinceRef.current = null;
+    wakingSinceRef.current = Date.now();
+    setWakingSince(wakingSinceRef.current);
     update("waking");
     startPolling();
   }, [startPolling, update]);
 
-  return { status, justWoke, markWaking };
+  return { status, justWoke, wakingSince, markWaking };
 };

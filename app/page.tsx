@@ -28,7 +28,15 @@ export default function Home() {
     scrollToBottom();
   }, [messages]);
 
+  // Sending waits for the database; "slow" and "error" stay unlocked so users are never stuck
+  const sendLocked = db.status === "checking" || db.status === "waking";
+
   const handlePromptSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
+    if (sendLocked) {
+      // covers Enter-key submission, which bypasses the disabled button
+      event.preventDefault();
+      return;
+    }
     await handleSubmit(event);
     refreshPrompts();
   };
@@ -50,7 +58,11 @@ export default function Home() {
                 v11
               </span>
             </div>
-            <DbStatusBanner status={db.status} justWoke={db.justWoke} />
+            <DbStatusBanner
+              status={db.status}
+              justWoke={db.justWoke}
+              wakingSince={db.wakingSince}
+            />
             <div className="flex h-[34rem] flex-col gap-4 overflow-y-auto bg-white p-5 sm:p-6">
               {messages.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-neutral-300 bg-neutral-50 p-5 text-sm text-neutral-700">
@@ -77,6 +89,7 @@ export default function Home() {
               onChange={setInput}
               onSubmit={handlePromptSubmit}
               isLoading={isLoading}
+              locked={sendLocked}
             />
           </div>
 

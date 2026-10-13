@@ -5,9 +5,19 @@ interface ChatInputProps {
   onChange: (value: string) => void;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   isLoading: boolean;
+  // true while the database is not ready: typing is allowed, sending is not
+  locked?: boolean;
+  lockedLabel?: string;
 }
 
-export const ChatInput = ({ value, onChange, onSubmit, isLoading }: ChatInputProps) => {
+export const ChatInput = ({
+  value,
+  onChange,
+  onSubmit,
+  isLoading,
+  locked = false,
+  lockedLabel = "Waiting for DB",
+}: ChatInputProps) => {
   return (
     <form
       onSubmit={onSubmit}
@@ -22,10 +32,10 @@ export const ChatInput = ({ value, onChange, onSubmit, isLoading }: ChatInputPro
         />
         <button
           type="submit"
-          disabled={isLoading}
+          disabled={isLoading || locked}
           className="group inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl border border-neutral-900 bg-neutral-900 px-6 py-3 text-sm font-mono uppercase tracking-[0.18em] text-white transition hover:-translate-y-0.5 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-60"
         >
-          {isLoading ? "Sending" : "Send"}
+          {isLoading ? "Sending" : locked ? lockedLabel : "Send"}
           <span className="opacity-0 transition group-hover:translate-x-0.5 group-hover:opacity-100">
             →
           </span>
