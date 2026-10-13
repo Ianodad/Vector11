@@ -14,19 +14,17 @@ import { usePromptRotation } from "./lib/hooks/usePromptRotation";
 
 export default function Home() {
   const db = useDbStatus();
-  const { messages, input, setInput, isLoading, loadingLabel, handleSubmit } = useChat({
-    onDbWaking: db.markWaking,
-  });
+  const { messages, input, setInput, isLoading, isStreaming, loadingLabel, handleSubmit } =
+    useChat({
+      onDbWaking: db.markWaking,
+    });
   const { contextPrompts, refreshPrompts } = usePromptRotation();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    // instant while streaming to avoid smooth-scroll jank
+    messagesEndRef.current?.scrollIntoView({ behavior: isStreaming ? "auto" : "smooth" });
+  }, [messages, isStreaming]);
 
   // Sending waits for the database; "slow" and "error" stay unlocked so users are never stuck
   const sendLocked = db.status === "checking" || db.status === "waking";
@@ -74,7 +72,7 @@ export default function Home() {
                   <ChatMessage key={message.id} message={message} />
                 ))
               )}
-              {isLoading && (
+              {isLoading && !isStreaming && (
                 <LoadingIndicator
                   label={
                     loadingLabel ??

@@ -310,6 +310,37 @@ const hybridSearch = async (
     .filter((h) => h.parentId);
 };
 
+type SourceRef = { url: string; source: string; scrapedAt?: string };
+
+// Top retrieved pages in rank order: de-duplicated by URL, http(s) only, max 5.
+const buildSources = (
+  ranked: Array<[string, { doc: Record<string, unknown> }]>,
+): SourceRef[] => {
+  const seen = new Set<string>();
+  const sources: SourceRef[] = [];
+  for (const [, { doc }] of ranked) {
+    const url = typeof doc.url === "string" ? doc.url.trim() : "";
+    if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    let host = "";
+    try {
+      host = new URL(url).hostname.replace(/^www\./, "");
+    } catch {
+      continue;
+    }
+    const scrapedAt = doc.scrapedAt;
+    sources.push({
+      url,
+      source: typeof doc.source === "string" && doc.source ? doc.source : host,
+      ...(typeof scrapedAt === "string" || scrapedAt instanceof Date
+        ? { scrapedAt: new Date(scrapedAt).toISOString() }
+        : {}),
+    });
+    if (sources.length >= 5) break;
+  }
+  return sources;
+};
+
 export async function POST(request: Request) {
   try {
     const clientIp = getClientIp(request);
@@ -360,6 +391,7 @@ export async function POST(request: Request) {
     });
 
     let docContent = "";
+    let sources: SourceRef[] = [];
 
     // Plan retrieval: generate 3 query variants + detect category in one LLM call
     const conversationContext = chatMessages
@@ -687,6 +719,9 @@ Output ONLY valid JSON, no markdown fences.`,
         );
       }
 
+      // Sources come from the same top-12 slice sent to the model (parents path and child fallback alike)
+      if (docContent) sources = buildSources(rankedParents.slice(0, 12));
+
       if (bestByParent.size === 0) {
         try {
           const total = await withDbResumeRetry(() =>
@@ -716,6 +751,7 @@ Output ONLY valid JSON, no markdown fences.`,
         );
       }
       docContent = "";
+      sources = [];
     }
 
     // template to pass to openai
@@ -792,13 +828,58 @@ Here is the retrieved context:
 ${docContent}`,
     };
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-5-mini",
-      messages: [template, ...chatMessages],
+    // Await the stream handshake BEFORE building the 200 response, so OpenAI auth/rate/5xx
+    // errors still land in the outer catch and return JSON 500.
+    const completion = await openai.chat.completions.create(
+      {
+        model: "gpt-5-mini",
+        messages: [template, ...chatMessages],
+        stream: true,
+      },
+      { signal: request.signal },
+    );
+
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: Record<string, unknown>) => {
+          controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+        };
+        try {
+          send({ type: "sources", sources });
+          for await (const chunk of completion) {
+            if (request.signal.aborted) break;
+            const text = chunk.choices[0]?.delta?.content;
+            if (text) send({ type: "delta", text });
+          }
+          if (!request.signal.aborted) send({ type: "done" });
+        } catch (streamErr) {
+          console.log("[chat] stream failed:", streamErr);
+          try {
+            if (!request.signal.aborted) {
+              send({ type: "error", message: "The answer stream was interrupted." });
+              send({ type: "done" });
+            }
+          } catch {
+            // controller already closed/errored
+          }
+        } finally {
+          try {
+            controller.close();
+          } catch {
+            // already closed
+          }
+        }
+      },
     });
 
-    const assistantMessage = response.choices[0]?.message?.content ?? "";
-    return Response.json({ message: assistantMessage });
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
   } catch (error) {
     console.log("[chat] request failed:", error);
     return Response.json(

@@ -48,3 +48,4 @@ scripts/logs/*
 /_*.mts
 .planning/
 .claude/settings.local.json
+.playwright-mcp/
