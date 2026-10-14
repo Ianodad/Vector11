@@ -32,6 +32,10 @@ interface RunResult {
   bucket: Bucket;
   ms: number;
   searchCalls: number;
+  plannerMs?: number;
+  embedMs?: number;
+  searchMs?: number;
+  parentMs?: number;
   precomputed: boolean;
   line?: string;
   matchedUrl?: string;
@@ -223,6 +227,10 @@ const runOnce = async (question: string, fact: Fact): Promise<RunResult> => {
         ...c,
         ms: r.stats.ms,
         searchCalls: r.stats.searchCalls,
+        plannerMs: r.stats.plannerMs,
+        embedMs: r.stats.embedMs,
+        searchMs: r.stats.searchMs,
+        parentMs: r.stats.parentMs,
         precomputed: r.plan.precomputed,
       };
     } catch (e) {
@@ -269,6 +277,10 @@ const setStats = (rows: Row[]) => {
     avgMs: avg(runs.map((r) => r.ms)),
     p95Ms: p95(runs.map((r) => r.ms)),
     avgSearchCalls: avg(runs.map((r) => r.searchCalls)),
+    avgPlannerMs: avg(runs.map((r) => r.plannerMs ?? 0)),
+    avgEmbedMs: avg(runs.map((r) => r.embedMs ?? 0)),
+    avgSearchMs: avg(runs.map((r) => r.searchMs ?? 0)),
+    avgParentMs: avg(runs.map((r) => r.parentMs ?? 0)),
     plannerUsed: runs.filter((r) => !r.precomputed && r.bucket !== "ERROR").length,
     precomputedUsed: runs.filter((r) => r.precomputed).length,
   };
@@ -341,6 +353,9 @@ const main = async () => {
     const s = summary[name];
     console.log(
       `${pad(name.toUpperCase(), 12)} recall ${s.pass}/${s.runs} = ${(s.recall * 100).toFixed(0)}%  | avg ${Math.round(s.avgMs)}ms p95 ${Math.round(s.p95Ms)}ms | avg searchCalls ${s.avgSearchCalls.toFixed(1)} | plan: ${s.precomputedUsed} precomputed / ${s.plannerUsed} planner`,
+    );
+    console.log(
+      `${pad("", 12)} phases avg: planner ${Math.round(s.avgPlannerMs)}ms embed ${Math.round(s.avgEmbedMs)}ms search ${Math.round(s.avgSearchMs)}ms parent ${Math.round(s.avgParentMs)}ms`,
     );
   }
   summary.all = setStats(rows);

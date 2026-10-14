@@ -37,6 +37,22 @@ const openai = new OpenAI({
   apiKey: OPEN_API_KEY,
 });
 
+const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high"] as const;
+type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+
+// Planner only rewrites a question into search queries; it does not need deep reasoning.
+const resolvePlannerEffort = (raw: string | undefined): ReasoningEffort => {
+  if (raw === undefined || raw === "") return "minimal";
+  if ((REASONING_EFFORTS as readonly string[]).includes(raw)) return raw as ReasoningEffort;
+  console.warn(
+    `[chat] invalid PLANNER_REASONING_EFFORT "${raw}", falling back to "minimal"`,
+  );
+  return "minimal";
+};
+const PLANNER_REASONING_EFFORT = resolvePlannerEffort(
+  process.env.PLANNER_REASONING_EFFORT,
+);
+
 const VALID_CATEGORIES = new Set([
   "news",
   "stats",
@@ -313,7 +329,14 @@ export interface RetrievalResult {
   parents: RetrievedParent[];
   sources: ChatSource[];
   plan: { queries: string[]; category: string | null; precomputed: boolean };
-  stats: { searchCalls: number; ms: number };
+  stats: {
+    searchCalls: number;
+    ms: number;
+    plannerMs: number;
+    embedMs: number;
+    searchMs: number;
+    parentMs: number;
+  };
 }
 
 export interface RetrieveInput {
@@ -336,6 +359,10 @@ export async function retrieveContext({
 }: RetrieveInput): Promise<RetrievalResult> {
   const startedAt = Date.now();
   const counter = { searchCalls: 0 };
+  let plannerMs = 0;
+  let embedMs = 0;
+  let searchMs = 0;
+  let parentMs = 0;
   let retrievedParents: RetrievedParent[] = [];
   let sources: ChatSource[] = [];
 
@@ -362,6 +389,7 @@ export async function retrieveContext({
       category: plan.category,
     });
   } else {
+    const plannerStart = Date.now();
     try {
       const planResult = await openai.chat.completions.create({
         model: "gpt-5-mini",
@@ -410,6 +438,7 @@ Output ONLY valid JSON, no markdown fences.`,
           { role: "user", content: conversationContext },
         ],
         response_format: { type: "json_object" },
+        reasoning_effort: PLANNER_REASONING_EFFORT,
       });
       const raw = planResult.choices[0]?.message?.content ?? "{}";
       const parsed = JSON.parse(raw) as Partial<RetrievalPlan>;
@@ -424,6 +453,7 @@ Output ONLY valid JSON, no markdown fences.`,
     } catch {
       // fall back to single query if planning fails
     }
+    plannerMs = Date.now() - plannerStart;
     console.log("[chat] retrieval plan", {
       queries: plan.queries.map((q) => q.slice(0, 60)),
       category: plan.category,
@@ -439,6 +469,7 @@ Output ONLY valid JSON, no markdown fences.`,
   const comparisonLikeRequest = /compare|comparison|versus|\bvs\b/.test(queryBundle.toLowerCase());
 
   // Embed all queries in parallel
+  const embedStart = Date.now();
   const embeddingResponses = await Promise.all(
     plan.queries.map((q) =>
       openai.embeddings.create({
@@ -450,6 +481,7 @@ Output ONLY valid JSON, no markdown fences.`,
     ),
   );
   const embeddings = embeddingResponses.map((r) => r.data[0].embedding);
+  embedMs = Date.now() - embedStart;
   console.log("[chat] embeddings", {
     count: embeddings.length,
     dimensions: embeddings[0]?.length,
@@ -476,6 +508,7 @@ Output ONLY valid JSON, no markdown fences.`,
     let rankedParents: Array<[string, ScoredDoc]>;
     let parentIds: string[];
 
+    const searchStart = Date.now();
     try {
       // Hybrid search (native $hybrid sort + rerank) — primary path
       const hybridFilters: Array<Record<string, unknown>> = retrievalCategories
@@ -612,8 +645,10 @@ Output ONLY valid JSON, no markdown fences.`,
         totalRawHits: searchResults.reduce((s, r) => s + r.length, 0),
       });
     }
+    searchMs = Date.now() - searchStart;
 
     // Step 2: Fetch parent chunks for rich LLM context
+    const parentStart = Date.now();
     let parents: Array<Record<string, unknown>> = [];
     if (parentIds.length > 0) {
       parents = await withDbResumeRetry(() =>
@@ -625,6 +660,7 @@ Output ONLY valid JSON, no markdown fences.`,
           .toArray(),
       );
     }
+    parentMs = Date.now() - parentStart;
     console.log("[chat] parent fetch results", { parentsFetched: parents.length });
 
     // Step 3: Use parent content as LLM context (richer than child content)
@@ -700,6 +736,13 @@ Output ONLY valid JSON, no markdown fences.`,
       category: plan.category,
       precomputed: Boolean(precomputed),
     },
-    stats: { searchCalls: counter.searchCalls, ms: Date.now() - startedAt },
+    stats: {
+      searchCalls: counter.searchCalls,
+      ms: Date.now() - startedAt,
+      plannerMs,
+      embedMs,
+      searchMs,
+      parentMs,
+    },
   };
 }
