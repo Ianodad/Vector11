@@ -10,6 +10,21 @@ const formatShortDate = (iso?: string) => {
   return date.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 };
 
+// Raw data endpoints (JSON/403 when clicked) are shown as plain text, not links
+const isMachineApiUrl = (url: string) => {
+  try {
+    const { hostname, pathname } = new URL(url);
+    return (
+      hostname.startsWith("api.") ||
+      hostname.includes(".api.") ||
+      pathname.startsWith("/api/") ||
+      pathname.startsWith("/apis/")
+    );
+  } catch {
+    return true;
+  }
+};
+
 interface ChatMessageProps {
   message: ChatMessageType;
 }
@@ -39,14 +54,18 @@ export const ChatMessage = ({ message }: ChatMessageProps) => {
                   const date = formatShortDate(source.scrapedAt);
                   return (
                     <li key={source.url}>
-                      <a
-                        href={source.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="hover:underline"
-                      >
-                        {source.source}
-                      </a>
+                      {isMachineApiUrl(source.url) ? (
+                        <span>{source.source}</span>
+                      ) : (
+                        <a
+                          href={source.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="hover:underline"
+                        >
+                          {source.source}
+                        </a>
+                      )}
                       {date && <span className="text-neutral-400"> · {date}</span>}
                     </li>
                   );
