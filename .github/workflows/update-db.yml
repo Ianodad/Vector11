@@ -65,3 +65,13 @@ jobs:
           FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: pnpm exec tsx scripts/loadDb.ts
+
+      - name: Evaluate retrieval against the fresh seed
+        env:
+          ASTRA_DB_NAMESPACE: ${{ secrets.ASTRA_DB_NAMESPACE }}
+          ASTRA_DB_COLLECTION: ${{ secrets.ASTRA_DB_COLLECTION }}
+          ASTRA_DB_API_ENDPOINT: ${{ secrets.ASTRA_DB_API_ENDPOINT }}
+          ASTRA_DB_APPLICATION_TOKEN: ${{ secrets.ASTRA_DB_APPLICATION_TOKEN }}
+          OPEN_API_KEY: ${{ secrets.OPEN_API_KEY }}
+          EMBEDDING_DIMENSIONS: ${{ vars.EMBEDDING_DIMENSIONS || '1536' }}
+        run: pnpm eval:retrieval --min 0.5 --set precomputed
